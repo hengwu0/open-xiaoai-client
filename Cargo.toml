@@ -1,0 +1,32 @@
+[package]
+name = "client-rust"
+version = "0.1.0"
+edition = "2024"
+default-run = "client"
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[workspace.metadata.cross.target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+crossbeam-queue = "0.3"
+futures-util = "0.3"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio-tungstenite = "0.26.2"
+uuid = { version = "1.18.1", features = ["v4"] }
