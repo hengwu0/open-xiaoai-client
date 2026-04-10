@@ -6,6 +6,6 @@ pub mod debug;
 pub mod error;
 pub mod version;
 
-pub use debug::{debug_err_log, debug_log, is_debug_enabled, set_debug_enabled};
+pub use debug::{debug_err_log, debug_log, debug_log_limited, is_debug_enabled, set_debug_enabled};
 pub use error::AppError;
 pub use version::VERSION;

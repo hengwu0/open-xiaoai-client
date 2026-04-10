@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::base::{debug_err_log, debug_log};
+use crate::base::{debug_err_log, debug_log, debug_log_limited};
 use crate::protocol::{AppMessage, Stream};
 use crate::transport::{InboundMessage, OutboundControl};
 
@@ -128,8 +130,10 @@ pub fn encode_outbound(outbound: OutboundControl) -> Message {
             Message::Text(text.into())
         }
         OutboundControl::Binary(bytes) => {
-            debug_log(
+            debug_log_limited(
                 "codec",
+                "encoding-outbound-binary-frame",
+                Duration::from_secs(60),
                 format!("Encoding outbound binary frame: {} bytes", bytes.len()),
             );
             Message::Binary(bytes.into())

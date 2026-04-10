@@ -2,9 +2,10 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use super::{AUDIO_CONFIG, AudioConfig};
-use crate::base::{AppError, debug_err_log, debug_log};
+use crate::base::{AppError, debug_err_log, debug_log, debug_log_limited};
 use crate::protocol::Stream;
 
 const A113_CAPTURE_BITS_PER_SAMPLE: u16 = 32;
@@ -177,7 +178,12 @@ impl AudioRecorder {
                             // - &capture：底层真实采集格式
                             let bytes = transform_stream_chunk(chunk, &requested, &capture);
                             if !bytes.is_empty() {
-                                debug_log("audio-recorder", format!("Prepared record chunk: {} bytes", bytes.len()));
+                                debug_log_limited(
+                                    "audio-recorder",
+                                    "prepared-record-chunk",
+                                    Duration::from_secs(60),
+                                    format!("Prepared record chunk: {} bytes", bytes.len()),
+                                );
                                 // 这里编码成协议里的 Stream 对象，而不是裸 PCM。
                                 // 这样 ws-writer 收到后不需要再知道“这是什么音频语义”，直接发即可。
                                 // 参数说明：

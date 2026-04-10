@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -9,7 +10,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, connect_async};
 
-use crate::base::{AppError, debug_err_log, debug_log};
+use crate::base::{AppError, debug_err_log, debug_log, debug_log_limited};
 use crate::transport::codec::{DecodeResult, decode_message, encode_outbound};
 use crate::transport::{
     OutboundControl, PeerId, PeerSource, RoutedInbound, SessionControl, WriteSignal,
@@ -465,7 +466,12 @@ fn spawn_ws_writer(
                                     );
                                     anyhow::Error::from(err)
                                 })?;
-                            debug_log("ws", "Outbound audio stream frame sent");
+                            debug_log_limited(
+                                "ws",
+                                "outbound-audio-stream-frame-sent",
+                                Duration::from_secs(60),
+                                "Outbound audio stream frame sent",
+                            );
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => {

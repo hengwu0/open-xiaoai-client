@@ -2,8 +2,9 @@ use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use crate::base::{AppError, debug_err_log, debug_log};
+use crate::base::{AppError, debug_err_log, debug_log, debug_log_limited};
 
 use super::{AUDIO_CONFIG, AudioConfig};
 
@@ -110,8 +111,10 @@ impl AudioPlayer {
                 // 单独线程负责把接收到的字节块持续写入 aplay 的标准输入。
                 let mut stdin = stdin;
                 while let Ok(bytes) = rx.recv() {
-                    debug_log(
+                    debug_log_limited(
                         "audio-player",
+                        "writing-aplay-stdin",
+                        Duration::from_secs(60),
                         format!("Writing {} bytes to aplay stdin", bytes.len()),
                     );
                     if let Err(err) = stdin.write_all(&bytes) {
@@ -145,8 +148,10 @@ impl AudioPlayer {
         // - 服务端刚开始推 play 流，但 start_play 还没完全执行完
         // - 当前 session 正在收尾，旧的播放数据仍有少量尾包进入
         if let Some(sender) = self.sender.lock().expect("player sender poisoned").as_ref() {
-            debug_log(
+            debug_log_limited(
                 "audio-player",
+                "queueing-play-chunk",
+                Duration::from_secs(60),
                 format!("Queueing play chunk: {} bytes", bytes.len()),
             );
             // 参数说明：
@@ -159,8 +164,10 @@ impl AudioPlayer {
                 anyhow::Error::from(err)
             })?;
         } else {
-            debug_log(
+            debug_log_limited(
                 "audio-player",
+                "dropping-play-chunk-because-player-is-not-started",
+                Duration::from_secs(60),
                 format!(
                     "Dropping play chunk because player is not started: {} bytes",
                     bytes.len()
