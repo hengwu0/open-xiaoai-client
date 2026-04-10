@@ -21,9 +21,11 @@ pub(crate) const LISTEN_ADDR: &str = "0.0.0.0:4399";
 //
 // 入参说明：
 // - runtime_handle：供线程内执行 async bind / accept / websocket 握手的 tokio runtime handle
+// - listen_token：listener 侧要求的 Bearer token
 // - ws_connect_event_writer：把握手成功的 PendingPeer 回传给 supervisor 的发送端
 pub(crate) fn spawn_listener_thread(
     runtime_handle: Handle,
+    listen_token: String,
     ws_connect_event_writer: mpsc::Sender<SupervisorEvent>,
 ) {
     thread::Builder::new()
@@ -52,7 +54,9 @@ pub(crate) fn spawn_listener_thread(
                                 );
                                 // 参数说明：
                                 // - stream：刚 accept 到的原始 TCP 连接，后续在这里补 ws 握手
-                                match accept_pending_peer(stream).await {
+                                // - listen_token.as_str()：listener 侧要求的 Bearer token
+                                match accept_pending_peer(stream, Some(listen_token.as_str())).await
+                                {
                                     Ok(pending_peer) => {
                                         // listener 线程不直接 attach peer；
                                         // 它只负责把“已就绪的 PendingPeer”送回 supervisor 总线。

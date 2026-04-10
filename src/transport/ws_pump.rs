@@ -9,8 +9,11 @@ use tokio::runtime::Handle;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, connect_async};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, accept_async, accept_hdr_async, connect_async,
+};
 
 use crate::base::{AppError, debug_err_log, debug_log, debug_log_limited};
 use crate::transport::codec::{DecodeResult, decode_message, encode_outbound};
@@ -188,9 +191,10 @@ fn build_connect_request(
 
 #[cfg(test)]
 mod tests {
+    use tokio_tungstenite::tungstenite::http::Request;
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
-    use super::build_connect_request;
+    use super::{build_connect_request, verify_listener_bearer_token};
 
     #[test]
     fn build_connect_request_includes_bearer_token_when_present() {
@@ -208,6 +212,32 @@ mod tests {
 
         assert!(request.headers().get(AUTHORIZATION).is_none());
     }
+
+    #[test]
+    fn verify_listener_bearer_token_accepts_matching_token() {
+        let request = Request::builder()
+            .header(AUTHORIZATION, "Bearer 123456")
+            .body(())
+            .unwrap();
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(101)
+            .body(())
+            .unwrap();
+
+        assert!(verify_listener_bearer_token(&request, response, "123456").is_ok());
+    }
+
+    #[test]
+    fn verify_listener_bearer_token_rejects_missing_or_mismatched_token() {
+        let request = Request::builder().body(()).unwrap();
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(101)
+            .body(())
+            .unwrap();
+
+        let error = verify_listener_bearer_token(&request, response, "123456").unwrap_err();
+        assert_eq!(error.status(), 401);
+    }
 }
 
 // accept_pending_peer 负责把 listener 刚 accept 到的 TCP 连接升级成 websocket，
@@ -219,17 +249,52 @@ mod tests {
 //
 // 入参说明：
 // - stream：listener 刚 accept 到的原始 TCP 连接
-pub async fn accept_pending_peer(stream: TcpStream) -> Result<PendingPeer, AppError> {
+// - expected_token：listener 侧要求的可选 Bearer token；为空时保持旧逻辑
+pub async fn accept_pending_peer(
+    stream: TcpStream,
+    expected_token: Option<&str>,
+) -> Result<PendingPeer, AppError> {
     // listener accept 到 TCP 后，在这里补 websocket 握手。
     // 参数说明：
     // - MaybeTlsStream::Plain(stream)：当前 listener 侧接入的是明文 TCP 连接
     // - accept_async(...)：在现有 TCP 连接上完成 websocket 握手升级
-    let ws_stream = accept_async(MaybeTlsStream::Plain(stream)).await?;
+    let ws_stream = if let Some(token) = expected_token.filter(|token| !token.is_empty()) {
+        accept_hdr_async(
+            MaybeTlsStream::Plain(stream),
+            move |req: &Request, response: Response| {
+                verify_listener_bearer_token(req, response, token)
+            },
+        )
+        .await?
+    } else {
+        accept_async(MaybeTlsStream::Plain(stream)).await?
+    };
     debug_log("ws", "Inbound listener WebSocket accepted");
     Ok(PendingPeer {
         source: PeerSource::Listener,
         ws_stream,
     })
+}
+
+fn verify_listener_bearer_token(
+    req: &Request,
+    response: Response,
+    expected_token: &str,
+) -> std::result::Result<Response, tokio_tungstenite::tungstenite::handshake::server::ErrorResponse>
+{
+    let actual = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if actual == format!("Bearer {expected_token}") {
+        return Ok(response);
+    }
+
+    Err(tokio_tungstenite::tungstenite::http::Response::builder()
+        .status(401)
+        .body(Some("Unauthorized".to_string()))
+        .expect("build unauthorized response"))
 }
 
 // spawn_peer_tasks 负责把一个 PendingPeer 真正接入当前 session 的读写体系。

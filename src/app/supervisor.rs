@@ -2,9 +2,12 @@ use std::sync::{Arc, mpsc};
 
 use tokio::runtime::{Builder, Runtime};
 
-use crate::app::ws_ingress::{ConnectServerStatus, spawn_connector_thread, spawn_listener_thread};
+use crate::app::ws_ingress::{
+    ConnectServerStatus, LISTEN_ADDR, spawn_connector_thread, spawn_listener_thread,
+};
 use crate::base::{AppError, debug_err_log, debug_log, is_debug_enabled};
 use crate::config::RunConfig;
+use crate::shell::device::get_device_listen_code;
 use crate::transport::{PeerId, PeerSource, PendingPeer};
 
 use super::session_peer::{PeerTaskExit, RouterExit, SessionRuntime};
@@ -99,11 +102,17 @@ impl AppSupervisor {
         let connect_server_status = Arc::new(ConnectServerStatus::new());
 
         if self.run_config.listen_enabled {
+            let listen_code = get_device_listen_code()?;
+            let listen_hint = format_listen_hint(&listen_code);
+            println!("{listen_hint}");
+            eprintln!("{listen_hint}");
             // 参数说明：
             // - self.ws_runtime.handle().clone()：让 listener 线程复用 supervisor 的 tokio runtime
+            // - listen_code：listener 侧要求的 ws 鉴权口令
             // - ws_connect_event_writer.clone()：把握手成功的 PendingPeer 回传给 supervisor 主循环
             spawn_listener_thread(
                 self.ws_runtime.handle().clone(),
+                listen_code,
                 ws_connect_event_writer.clone(),
             );
         }
@@ -324,4 +333,18 @@ impl AppSupervisor {
             }
         }
     }
+}
+
+// format_listen_hint 生成 `-l` 模式启动时打印给用户的高亮提示块。
+//
+// 入参说明：
+// - listen_code：当前设备根据 MAC 派生出的 8 位 listener 鉴权码
+fn format_listen_hint(listen_code: &str) -> String {
+    format!(
+        "================ LISTEN READY ================\n\
+WebSocket listen: {LISTEN_ADDR}\n\
+Listen code: {listen_code}\n\
+WebSocket access requires `Authorization: Bearer {listen_code};` Missing or invalid credentials will result in a 401 response.\n\
+=============================================="
+    )
 }
