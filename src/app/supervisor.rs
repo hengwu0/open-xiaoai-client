@@ -111,11 +111,13 @@ impl AppSupervisor {
             // 参数说明：
             // - self.ws_runtime.handle().clone()：供 connector 在线程内执行 async connect
             // - url：当前进程级配置指定的主动连接目标
+            // - self.run_config.ws_token.clone()：主动 connect 时可选附带的 ws Bearer token
             // - ws_connect_event_writer.clone()：把 connect 成功的 PendingPeer 送回 supervisor
             // - connect_server_status.clone()：保证同一时刻最多只有一个活跃 outbound peer
             spawn_connector_thread(
                 self.ws_runtime.handle().clone(),
                 url,
+                self.run_config.ws_token.clone(),
                 ws_connect_event_writer.clone(),
                 connect_server_status.clone(),
             );

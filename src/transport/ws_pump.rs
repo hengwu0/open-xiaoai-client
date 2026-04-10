@@ -8,6 +8,8 @@ use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, connect_async};
 
 use crate::base::{AppError, debug_err_log, debug_log, debug_log_limited};
@@ -137,17 +139,23 @@ impl WsPeerHandle {
 // 入参说明：
 // - handle：supervisor 持有的 tokio runtime handle；这里借它执行 async connect
 // - url：目标 websocket 地址，通常来自运行配置里的 server_url
-pub fn connect_pending_peer(handle: &Handle, url: &str) -> Result<PendingPeer, AppError> {
+// - ws_token：可选 Bearer token；为空时保持旧的无认证握手逻辑
+pub fn connect_pending_peer(
+    handle: &Handle,
+    url: &str,
+    ws_token: Option<&str>,
+) -> Result<PendingPeer, AppError> {
     // outbound connect 成功后，只返回一个 PendingPeer；
     // 真正把它挂进当前 session，是 supervisor 的职责，不在这里完成。
     debug_log(
         "ws",
         format!("Attempting outbound WebSocket connection to {url}"),
     );
+    let request = build_connect_request(url, ws_token)?;
     // 参数说明：
     // - handle.block_on(...)：复用已有 runtime 执行 async connect，避免这里额外起 runtime
-    // - connect_async(url)：按给定 websocket 地址发起标准 websocket 握手
-    let (ws_stream, _) = handle.block_on(async { connect_async(url).await })?;
+    // - connect_async(request)：按给定 websocket 请求发起握手；有 token 时会自动带 Authorization
+    let (ws_stream, _) = handle.block_on(async { connect_async(request).await })?;
     debug_log("ws", format!("Outbound WebSocket connected: {url}"));
     Ok(PendingPeer {
         source: PeerSource::OutboundConnect {
@@ -155,6 +163,51 @@ pub fn connect_pending_peer(handle: &Handle, url: &str) -> Result<PendingPeer, A
         },
         ws_stream,
     })
+}
+
+// build_connect_request 构造 outbound websocket 握手请求。
+//
+// 入参说明：
+// - url：目标 websocket 地址
+// - ws_token：可选 Bearer token；为空时不附带任何 Authorization 头
+fn build_connect_request(
+    url: &str,
+    ws_token: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, AppError> {
+    let mut request = url.into_client_request()?;
+    if let Some(token) = ws_token.filter(|token| !token.is_empty()) {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+        debug_log(
+            "ws",
+            "Outbound WebSocket request will include Authorization header",
+        );
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+
+    use super::build_connect_request;
+
+    #[test]
+    fn build_connect_request_includes_bearer_token_when_present() {
+        let request = build_connect_request("ws://127.0.0.1:9000", Some("secret-token")).unwrap();
+
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Bearer secret-token"
+        );
+    }
+
+    #[test]
+    fn build_connect_request_keeps_old_behavior_without_token() {
+        let request = build_connect_request("ws://127.0.0.1:9000", None).unwrap();
+
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
 }
 
 // accept_pending_peer 负责把 listener 刚 accept 到的 TCP 连接升级成 websocket，

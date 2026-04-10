@@ -106,11 +106,13 @@ pub(crate) fn spawn_listener_thread(
 // 入参说明：
 // - runtime_handle：供线程内执行 async websocket connect 的 tokio runtime handle
 // - url：当前进程级主动连接目标
+// - ws_token：主动 connect 时可选附带的 Bearer token
 // - ws_connect_event_writer：把 connect 成功的 PendingPeer 回传给 supervisor 的发送端
 // - connect_server_status：主动外连闸门，确保同时最多只有一个活跃 outbound peer
 pub(crate) fn spawn_connector_thread(
     runtime_handle: Handle,
     url: String,
+    ws_token: Option<String>,
     ws_connect_event_writer: mpsc::Sender<SupervisorEvent>,
     connect_server_status: Arc<ConnectServerStatus>,
 ) {
@@ -126,7 +128,8 @@ pub(crate) fn spawn_connector_thread(
                 // 参数说明：
                 // - &runtime_handle：用 supervisor 的 tokio runtime 执行 async connect
                 // - &url：当前进程级配置指定的主动连接目标
-                match connect_pending_peer(&runtime_handle, &url) {
+                // - ws_token.as_deref()：按需附带 Bearer token；未配置时保持旧逻辑
+                match connect_pending_peer(&runtime_handle, &url, ws_token.as_deref()) {
                     Ok(pending_peer) => {
                         connect_server_status.mark_connected();
                         // 和 listener 一样，connector 线程本身不触碰 session，只上报 PendingPeer。
