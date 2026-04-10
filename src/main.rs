@@ -1,13 +1,15 @@
 mod app;
 mod audio;
 mod base;
+mod config;
 mod monitor;
 mod protocol;
 mod shell;
 mod transport;
 
-use app::{AppSupervisor, parse_args, usage};
+use app::AppSupervisor;
 use base::{debug_log, set_debug_enabled};
+use config::{parse_args, usage};
 
 // main 是整个进程的唯一入口。
 //

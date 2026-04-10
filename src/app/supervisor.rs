@@ -2,9 +2,9 @@ use std::sync::{Arc, mpsc};
 
 use tokio::runtime::{Builder, Runtime};
 
-use crate::app::RunConfig;
 use crate::app::ws_ingress::{ConnectServerStatus, spawn_connector_thread, spawn_listener_thread};
 use crate::base::{AppError, debug_err_log, debug_log, is_debug_enabled};
+use crate::config::RunConfig;
 use crate::transport::{PeerId, PeerSource, PendingPeer};
 
 use super::session_peer::{PeerTaskExit, RouterExit, SessionRuntime};
