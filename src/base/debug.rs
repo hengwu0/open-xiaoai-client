@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Local;
 
@@ -10,9 +10,9 @@ use chrono::Local;
 //
 // 换句话说，这里解决的是“可观测性最小闭环”，而不是完整日志系统。
 
-// debug 开关只会在启动阶段写一次，后面都是只读访问。
-// 用 OnceLock 可以把“只初始化一次，后续只读”的约束直接编码进类型里。
-static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+// debug 开关默认关闭，启动阶段按配置写入一次，后面都是只读访问。
+// 这里用 AtomicBool 保存最小状态，避免为单个布尔开关引入额外初始化封装。
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // set_debug_enabled 负责在进程启动阶段初始化全局 debug 开关。
 //
@@ -22,20 +22,18 @@ static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 // 入参说明：
 // - enabled：是否启用调试日志；通常由命令行参数解析结果决定
 pub fn set_debug_enabled(enabled: bool) {
-    // 只接受第一次写入。
-    // 当前调用路径里它只会在 main 阶段调用一次，因此忽略重复 set 即可。
-    let _ = DEBUG_ENABLED.set(enabled);
+    // 当前调用路径里它只会在 main 阶段设置，因此这里直接覆盖即可。
+    DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 // is_debug_enabled 负责读取当前进程级 debug 开关状态。
 //
-// 其他模块不会直接接触 OnceLock，而是统一通过这个函数拿到“当前是否应该打印调试日志”。
+// 其他模块不会直接接触全局 AtomicBool，而是统一通过这个函数拿到“当前是否应该打印调试日志”。
 //
 // 入参说明：
 // - 无
 pub fn is_debug_enabled() -> bool {
-    // 如果启动阶段没有显式设置，就默认关闭 debug。
-    *DEBUG_ENABLED.get().unwrap_or(&false)
+    DEBUG_ENABLED.load(Ordering::Relaxed)
 }
 
 // debug_log 负责输出普通调试日志到 stdout。

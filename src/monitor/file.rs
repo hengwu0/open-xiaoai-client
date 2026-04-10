@@ -6,13 +6,14 @@ use std::mem::size_of;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crate::base::{AppError, debug_err_log, debug_log};
 
 const INOTIFY_BUFFER_LEN: usize = size_of::<libc::inotify_event>() * 4096;
+const UNREGISTERED_FD: RawFd = -1;
 const FILE_WATCH_MASK: u32 =
     libc::IN_MODIFY | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF | libc::IN_ATTRIB;
 const DIRECTORY_WATCH_MASK: u32 =
@@ -56,11 +57,20 @@ impl FileMonitorHandle {
 // 也就是说：
 // - “关闭当前 inotify fd”负责唤醒已经阻塞住的 read
 // - “shutdown_requested”负责覆盖 fd 切换瞬间的竞态窗口
-#[derive(Default)]
 struct FileMonitorControl {
     shutdown_requested: AtomicBool,
-    file_inotify_fd: Mutex<Option<RawFd>>,
-    directory_inotify_fd: Mutex<Option<RawFd>>,
+    file_inotify_fd: AtomicI32,
+    directory_inotify_fd: AtomicI32,
+}
+
+impl Default for FileMonitorControl {
+    fn default() -> Self {
+        Self {
+            shutdown_requested: AtomicBool::new(false),
+            file_inotify_fd: AtomicI32::new(UNREGISTERED_FD),
+            directory_inotify_fd: AtomicI32::new(UNREGISTERED_FD),
+        }
+    }
 }
 
 impl FileMonitorControl {
@@ -93,15 +103,17 @@ impl FileMonitorControl {
     // - kind：这个 fd 属于文件监听还是目录监听
     // - fd：刚创建好的 inotify 文件描述符
     fn register_inotify_fd(&self, kind: InotifyKind, fd: RawFd) -> Result<bool, AppError> {
-        let mut slot = self
-            .slot(kind)
-            .lock()
-            .map_err(|_| anyhow::anyhow!("{} inotify fd mutex poisoned", kind.label()))?;
         if self.is_shutdown_requested() {
             let _ = unsafe { libc::close(fd) };
             return Ok(false);
         }
-        *slot = Some(fd);
+        self.slot(kind).store(fd, Ordering::SeqCst);
+        if self.is_shutdown_requested() {
+            if let Some(fd) = self.take_inotify_fd_if_matches(kind, fd) {
+                let _ = unsafe { libc::close(fd) };
+            }
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -115,12 +127,8 @@ impl FileMonitorControl {
     // - fd：调用方认为“自己拥有”的 fd
     fn take_inotify_fd_if_matches(&self, kind: InotifyKind, fd: RawFd) -> Option<RawFd> {
         self.slot(kind)
-            .lock()
+            .compare_exchange(fd, UNREGISTERED_FD, Ordering::SeqCst, Ordering::SeqCst)
             .ok()
-            .and_then(|mut slot| match *slot {
-                Some(current) if current == fd => slot.take(),
-                _ => None,
-            })
     }
 
     // close_registered_fd 关闭某个类型当前登记在槽位里的 inotify fd。
@@ -129,17 +137,8 @@ impl FileMonitorControl {
     // - self：当前 monitor 的 shutdown 控制对象
     // - kind：要关闭的是文件监听 fd 还是目录监听 fd
     fn close_registered_fd(&self, kind: InotifyKind) {
-        let fd = match self.slot(kind).lock() {
-            Ok(mut slot) => slot.take(),
-            Err(_) => {
-                debug_err_log(
-                    "file-monitor",
-                    format!("{} inotify fd mutex poisoned during close", kind.label()),
-                );
-                None
-            }
-        };
-        if let Some(fd) = fd {
+        let fd = self.slot(kind).swap(UNREGISTERED_FD, Ordering::SeqCst);
+        if fd != UNREGISTERED_FD {
             let _ = unsafe { libc::close(fd) };
         }
     }
@@ -149,7 +148,7 @@ impl FileMonitorControl {
     // 入参说明：
     // - self：当前 monitor 的 shutdown 控制对象
     // - kind：要访问的槽位类型
-    fn slot(&self, kind: InotifyKind) -> &Mutex<Option<RawFd>> {
+    fn slot(&self, kind: InotifyKind) -> &AtomicI32 {
         match kind {
             InotifyKind::File => &self.file_inotify_fd,
             InotifyKind::Directory => &self.directory_inotify_fd,
@@ -161,19 +160,6 @@ impl FileMonitorControl {
 enum InotifyKind {
     File,
     Directory,
-}
-
-impl InotifyKind {
-    // label 返回当前 inotify 类型对应的人类可读标签。
-    //
-    // 入参说明：
-    // - self：当前 inotify 类型枚举值
-    fn label(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Directory => "directory",
-        }
-    }
 }
 
 // ManagedInotify 负责两件事：
