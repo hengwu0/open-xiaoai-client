@@ -7,13 +7,12 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crate::base::{AppError, debug_err_log, debug_log};
 
 const INOTIFY_BUFFER_LEN: usize = size_of::<libc::inotify_event>() * 4096;
-const UNREGISTERED_FD: RawFd = -1;
 const FILE_WATCH_MASK: u32 =
     libc::IN_MODIFY | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF | libc::IN_ATTRIB;
 const DIRECTORY_WATCH_MASK: u32 =
@@ -46,34 +45,30 @@ impl FileMonitorHandle {
     }
 }
 
-// 这里保留了一个极小的 shutdown 控制对象，而不是完全“只靠 close 当前 fd”。
-// 原因是 monitor 线程会在“文件 inotify”和“目录 inotify”之间切换：
+// FileMonitorControl 同时承担两层职责：
+// 1. shutdown_requested：覆盖 monitor 在线程内部切换“文件监听 / 目录监听”时的竞态窗口
+// 2. shutdown_event_fd：专门负责把阻塞在 poll/read 上的线程稳定唤醒
 //
-// 1. 如果 close() 恰好发生在旧 fd 已经关闭、但新 fd 还没安装进共享槽位的窗口里，
-//    那么单靠关闭当前 fd 会错过这次 stop，请求无法跨越这个切换窗口。
-// 2. 因此需要一个持久化的 shutdown 标记，让线程在每次准备进入下一段阻塞前，
-//    都能看见“当前这轮已经要求退出了”。
-//
-// 也就是说：
-// - “关闭当前 inotify fd”负责唤醒已经阻塞住的 read
-// - “shutdown_requested”负责覆盖 fd 切换瞬间的竞态窗口
+// 这里不再依赖“另一个线程直接 close 当前 inotify fd”来取消阻塞 I/O。
+// 在 Linux 上，这种跨线程 close 并不能可靠地打断另外一个线程里已经进入内核的 read；
+// 更稳妥的做法是给 monitor 一条独立的停止唤醒通道，让它自己在同一线程里收尾并关闭 inotify。
 struct FileMonitorControl {
     shutdown_requested: AtomicBool,
-    file_inotify_fd: AtomicI32,
-    directory_inotify_fd: AtomicI32,
-}
-
-impl Default for FileMonitorControl {
-    fn default() -> Self {
-        Self {
-            shutdown_requested: AtomicBool::new(false),
-            file_inotify_fd: AtomicI32::new(UNREGISTERED_FD),
-            directory_inotify_fd: AtomicI32::new(UNREGISTERED_FD),
-        }
-    }
+    shutdown_event_fd: RawFd,
 }
 
 impl FileMonitorControl {
+    fn new() -> Result<Self, AppError> {
+        let shutdown_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if shutdown_event_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            shutdown_requested: AtomicBool::new(false),
+            shutdown_event_fd,
+        })
+    }
+
     // is_shutdown_requested 返回当前 monitor 是否已经收到退出请求。
     //
     // 入参说明：
@@ -82,92 +77,59 @@ impl FileMonitorControl {
         self.shutdown_requested.load(Ordering::SeqCst)
     }
 
-    // close 发起 monitor 关闭流程，并主动关闭当前可能阻塞中的 inotify fd。
+    // close 发起 monitor 关闭流程，并通过 shutdown eventfd 唤醒可能阻塞中的 poll/read。
     //
     // 入参说明：
     // - self：当前 monitor 的 shutdown 控制对象
     fn close(&self) {
-        self.shutdown_requested.store(true, Ordering::SeqCst);
-        // 先关目录 inotify，再关文件 inotify。
-        // 这样如果当前线程正卡在“等待文件重建”的路径上，会第一时间被唤醒。
-        self.close_registered_fd(InotifyKind::Directory);
-        self.close_registered_fd(InotifyKind::File);
-    }
-
-    // register_inotify_fd 把一个新建的 inotify fd 注册到共享控制对象里。
-    //
-    // 如果这时已经收到 shutdown 请求，就会立即关闭该 fd，并告诉调用方不要继续使用它。
-    //
-    // 入参说明：
-    // - self：当前 monitor 的 shutdown 控制对象
-    // - kind：这个 fd 属于文件监听还是目录监听
-    // - fd：刚创建好的 inotify 文件描述符
-    fn register_inotify_fd(&self, kind: InotifyKind, fd: RawFd) -> Result<bool, AppError> {
-        if self.is_shutdown_requested() {
-            let _ = unsafe { libc::close(fd) };
-            return Ok(false);
+        if self.shutdown_requested.swap(true, Ordering::SeqCst) {
+            return;
         }
-        self.slot(kind).store(fd, Ordering::SeqCst);
-        if self.is_shutdown_requested() {
-            if let Some(fd) = self.take_inotify_fd_if_matches(kind, fd) {
-                let _ = unsafe { libc::close(fd) };
+
+        let value: u64 = 1;
+        loop {
+            let write_result = unsafe {
+                libc::write(
+                    self.shutdown_event_fd,
+                    (&value as *const u64).cast::<libc::c_void>(),
+                    size_of::<u64>(),
+                )
+            };
+            if write_result >= 0 {
+                break;
             }
-            return Ok(false);
-        }
-        Ok(true)
-    }
 
-    // take_inotify_fd_if_matches 只有在槽位里正好还是这个 fd 时，才把它取出来。
-    //
-    // 这样可以避免新旧 fd 切换时误关掉不属于自己的那一个。
-    //
-    // 入参说明：
-    // - self：当前 monitor 的 shutdown 控制对象
-    // - kind：要访问的槽位类型
-    // - fd：调用方认为“自己拥有”的 fd
-    fn take_inotify_fd_if_matches(&self, kind: InotifyKind, fd: RawFd) -> Option<RawFd> {
-        self.slot(kind)
-            .compare_exchange(fd, UNREGISTERED_FD, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()
-    }
-
-    // close_registered_fd 关闭某个类型当前登记在槽位里的 inotify fd。
-    //
-    // 入参说明：
-    // - self：当前 monitor 的 shutdown 控制对象
-    // - kind：要关闭的是文件监听 fd 还是目录监听 fd
-    fn close_registered_fd(&self, kind: InotifyKind) {
-        let fd = self.slot(kind).swap(UNREGISTERED_FD, Ordering::SeqCst);
-        if fd != UNREGISTERED_FD {
-            let _ = unsafe { libc::close(fd) };
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => break,
+                _ => {
+                    debug_err_log(
+                        "file-monitor",
+                        format!("Failed to signal file monitor shutdown eventfd: {err}"),
+                    );
+                    break;
+                }
+            }
         }
     }
 
-    // slot 返回指定 inotify 类型对应的共享槽位。
-    //
-    // 入参说明：
-    // - self：当前 monitor 的 shutdown 控制对象
-    // - kind：要访问的槽位类型
-    fn slot(&self, kind: InotifyKind) -> &AtomicI32 {
-        match kind {
-            InotifyKind::File => &self.file_inotify_fd,
-            InotifyKind::Directory => &self.directory_inotify_fd,
-        }
+    fn shutdown_event_fd(&self) -> RawFd {
+        self.shutdown_event_fd
     }
 }
 
-#[derive(Clone, Copy)]
-enum InotifyKind {
-    File,
-    Directory,
+impl Drop for FileMonitorControl {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::close(self.shutdown_event_fd) };
+    }
 }
 
 // ManagedInotify 负责两件事：
-// 1. 创建一个新的 inotify fd，并注册到共享控制对象里，便于 close() 时从别的线程把它关掉
-// 2. 在当前作用域结束时，把属于自己的 fd 从控制对象里摘掉并关闭
+// 1. 创建一个新的 inotify fd，供当前 monitor 线程在某一阶段独占使用
+// 2. 在当前作用域结束时，把这个 fd 关闭
 struct ManagedInotify {
     fd: RawFd,
-    kind: InotifyKind,
     control: Arc<FileMonitorControl>,
 }
 
@@ -176,16 +138,21 @@ impl ManagedInotify {
     //
     // 入参说明：
     // - control：当前 monitor 共享的 shutdown 控制对象
-    // - kind：当前要创建的是文件监听 fd 还是目录监听 fd
-    fn new(control: Arc<FileMonitorControl>, kind: InotifyKind) -> Result<Option<Self>, AppError> {
+    fn new(control: Arc<FileMonitorControl>) -> Result<Option<Self>, AppError> {
+        if control.is_shutdown_requested() {
+            return Ok(None);
+        }
+
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        if !control.register_inotify_fd(kind, fd)? {
+        if control.is_shutdown_requested() {
+            let _ = unsafe { libc::close(fd) };
             return Ok(None);
         }
-        Ok(Some(Self { fd, kind, control }))
+
+        Ok(Some(Self { fd, control }))
     }
 
     // fd 返回底层 inotify 文件描述符。
@@ -194,6 +161,10 @@ impl ManagedInotify {
     // - self：当前托管的 inotify 句柄
     fn fd(&self) -> RawFd {
         self.fd
+    }
+
+    fn shutdown_event_fd(&self) -> RawFd {
+        self.control.shutdown_event_fd()
     }
 
     // is_shutdown_requested 透传当前 monitor 的 shutdown 标记。
@@ -206,14 +177,12 @@ impl ManagedInotify {
 }
 
 impl Drop for ManagedInotify {
-    // drop 在作用域结束时摘掉并关闭仍归自己拥有的 inotify fd。
+    // drop 在作用域结束时关闭当前 inotify fd。
     //
     // 入参说明：
     // - self：当前托管的 inotify 句柄
     fn drop(&mut self) {
-        if let Some(fd) = self.control.take_inotify_fd_if_matches(self.kind, self.fd) {
-            let _ = unsafe { libc::close(fd) };
-        }
+        let _ = unsafe { libc::close(self.fd) };
     }
 }
 
@@ -240,7 +209,7 @@ where
     FR: FnMut() -> Result<(), AppError> + Send + 'static,
     FL: FnMut(&str) -> Result<(), AppError> + Send + 'static,
 {
-    let control = Arc::new(FileMonitorControl::default());
+    let control = Arc::new(FileMonitorControl::new().expect("create file monitor control"));
     let control_for_thread = control.clone();
     let join_handle = thread::Builder::new()
         .name(thread_name.to_string())
@@ -323,6 +292,11 @@ where
         }
     }
 
+    debug_log(
+        component,
+        format!("File monitor thread exiting: {}", file_path.display()),
+    );
+
     Ok(())
 }
 
@@ -397,7 +371,7 @@ fn wait_for_file_recreation(
         return Ok(MonitorLoopResult::Stop);
     }
 
-    let Some(inotify) = ManagedInotify::new(control.clone(), InotifyKind::Directory)? else {
+    let Some(inotify) = ManagedInotify::new(control.clone())? else {
         return Ok(MonitorLoopResult::Closed);
     };
     let watch_descriptor = match add_watch(inotify.fd(), parent_dir, DIRECTORY_WATCH_MASK) {
@@ -494,7 +468,7 @@ where
     FR: FnMut() -> Result<(), AppError>,
     FL: FnMut(&str) -> Result<(), AppError>,
 {
-    let Some(inotify) = ManagedInotify::new(control.clone(), InotifyKind::File)? else {
+    let Some(inotify) = ManagedInotify::new(control.clone())? else {
         return Ok(MonitorLoopResult::Closed);
     };
     let watch_descriptor = match add_watch(inotify.fd(), file_path, FILE_WATCH_MASK) {
@@ -702,9 +676,10 @@ fn watch_directory_events(
     }
 }
 
-// read_inotify_events 从 inotify fd 上阻塞读取一批事件。
+// read_inotify_events 先等待“inotify 就绪”或“shutdown 事件到来”，然后读取一批事件。
 //
-// 它会自动处理 EINTR，并在 shutdown 场景下把特定 EBADF/EINVAL 转成 Closed 语义。
+// 这里使用 `poll(inotify_fd, shutdown_event_fd)` 而不是依赖“另一个线程 close 当前 inotify fd”
+// 来中断 read。这样可以稳定地把阻塞中的 monitor 唤醒出来。
 //
 // 入参说明：
 // - inotify：当前托管的 inotify 句柄
@@ -714,6 +689,52 @@ fn read_inotify_events(
     buffer: &mut [u8],
 ) -> Result<InotifyReadResult, AppError> {
     loop {
+        if inotify.is_shutdown_requested() {
+            return Ok(InotifyReadResult::Closed);
+        }
+
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: inotify.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: inotify.shutdown_event_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let poll_result =
+            unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as libc::nfds_t, -1) };
+        if poll_result < 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EINTR)) {
+                continue;
+            }
+            return Err(err.into());
+        }
+
+        if poll_fds[1].revents & libc::POLLIN != 0 {
+            return Ok(InotifyReadResult::Closed);
+        }
+
+        let file_revents = poll_fds[0].revents;
+        if file_revents == 0 {
+            continue;
+        }
+        if file_revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            if inotify.is_shutdown_requested() {
+                return Ok(InotifyReadResult::Closed);
+            }
+            return Err(anyhow::anyhow!(
+                "inotify poll returned unexpected revents: {file_revents}"
+            ));
+        }
+        if file_revents & libc::POLLIN == 0 {
+            continue;
+        }
+
         let read_len = unsafe {
             libc::read(
                 inotify.fd(),
@@ -725,6 +746,9 @@ fn read_inotify_events(
         if read_len < 0 {
             let err = std::io::Error::last_os_error();
             if matches!(err.raw_os_error(), Some(libc::EINTR)) {
+                continue;
+            }
+            if matches!(err.raw_os_error(), Some(libc::EAGAIN)) {
                 continue;
             }
             if inotify.is_shutdown_requested()
@@ -743,6 +767,91 @@ fn read_inotify_events(
         }
 
         return Ok(InotifyReadResult::Events(read_len as usize));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::spawn_file_monitor;
+
+    fn unique_test_path(file_name: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_millis();
+        std::env::temp_dir().join(format!(
+            "client-rust-file-monitor-test-{}-{millis}-{file_name}",
+            std::process::id()
+        ))
+    }
+
+    fn leaked_path_string(path: &Path) -> &'static str {
+        Box::leak(path.display().to_string().into_boxed_str())
+    }
+
+    fn join_with_timeout(
+        handle: super::FileMonitorHandle,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = handle.join().join();
+            let _ = done_tx.send(result);
+        });
+
+        match done_rx.recv_timeout(timeout) {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(err.into()),
+            Ok(Err(_)) => Err("file monitor join thread panicked".into()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[test]
+    fn close_wakes_monitor_while_waiting_on_file_inotify() {
+        let file_path = unique_test_path("existing.log");
+        fs::create_dir_all(file_path.parent().expect("temp path parent")).unwrap();
+        File::create(&file_path).unwrap();
+
+        let handle = spawn_file_monitor(
+            "test-existing-file-monitor-thread",
+            "test-file-monitor",
+            leaked_path_string(&file_path),
+            || Ok(()),
+            |_| Ok(()),
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        handle.close();
+        join_with_timeout(handle, Duration::from_secs(2)).unwrap();
+
+        let _ = fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn close_wakes_monitor_while_waiting_on_directory_inotify() {
+        let dir_path = unique_test_path("missing-parent");
+        fs::create_dir_all(&dir_path).unwrap();
+        let file_path = dir_path.join("missing.log");
+
+        let handle = spawn_file_monitor(
+            "test-missing-file-monitor-thread",
+            "test-file-monitor",
+            leaked_path_string(&file_path),
+            || Ok(()),
+            |_| Ok(()),
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        handle.close();
+        join_with_timeout(handle, Duration::from_secs(2)).unwrap();
+
+        let _ = fs::remove_dir_all(&dir_path);
     }
 }
 

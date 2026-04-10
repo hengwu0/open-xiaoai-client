@@ -51,7 +51,7 @@ impl MonitorHandles {
         Self {
             // 参数说明：
             // - route_channel_writer.clone()：instruction 事件通过它写回 session 总线
-            // - instruction monitor 通过 close() 关闭内部 inotify fd 来退出
+            // - instruction monitor 通过 close() 写 shutdown eventfd，唤醒内部 poll 退出
             instruction: spawn_instruction_monitor(route_channel_writer.clone()),
             // 参数说明：
             // - route_channel_writer.clone()：playing 事件通过它写回 session 总线
@@ -60,7 +60,7 @@ impl MonitorHandles {
             playing: spawn_playing_monitor(route_channel_writer.clone()),
             // 参数说明：
             // - route_channel_writer：kws 事件通过它写回 session 总线
-            // - kws monitor 通过 close() 关闭内部 inotify fd 来退出
+            // - kws monitor 通过 close() 写 shutdown eventfd，唤醒内部 poll 退出
             kws: spawn_kws_monitor(route_channel_writer),
         }
     }

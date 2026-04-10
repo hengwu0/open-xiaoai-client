@@ -122,7 +122,7 @@ impl SessionRuntime {
 
         // 参数说明：
         // - route_channel_writer.clone()：monitor 产生的本地事件统一写回 session 总线
-        // - 文件类 monitor 通过 close() 关闭内部 fd 退出，playing monitor 通过 kill 子进程退出
+        // - 文件类 monitor 通过 close() 唤醒内部 poll 退出，playing monitor 通过 kill 子进程退出
         let monitor_handles = MonitorHandles::spawn(route_channel_writer.clone());
 
         debug_log(
