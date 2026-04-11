@@ -2,7 +2,23 @@
 
 ## 项目简介
 
-`client-rust` 是一个运行在设备侧的 WebSocket 音频客户端。
+`client-rust` 是一个运行在小爱音箱里的 WebSocket 音频客户端，用于在音箱本地与远端服务之间转发音频、事件和控制消息。
+
+这个项目是对 [`open-xiaoai/packages/client-rust`](https://github.com/idootop/open-xiaoai/tree/main/packages/client-rust) 的完全重构，目标是在延续原有使用场景的基础上，进一步提升 client 程序的性能、安全性与可维护性。原始项目目前已经归档，不再维护。
+
+本项目完整兼容旧版 client 的全部输入输出接口，保持原有程序对接方式不变，可直接平滑替换旧程序。
+
+> 如果这个项目对你有帮助，欢迎点一个 Star ⭐
+
+### 当前版本的重点改进
+
+- 大幅降低 CPU 占用：将 client 程序的 CPU 占用从旧版本接近 `100%` 的常驻占用，优化到约 `1%` 的日常占用水平。
+- 重做 `session` 生命周期：`session` 不再绑定单个 WebSocket 连接，而是绑定一组共享播放器、录音器、monitor 和 router 的 peer 集合，资源创建与回收更清晰。
+- 支持更稳定的多连接模型：除 `connect-only` 外，还支持 `listen-only` 和 `hybrid` 模式，监听与主动重连常驻运行，不因单个 peer 波动打断整轮服务。
+- 优化音频分发路径：录音只保留单路采集，再按订阅关系 fanout 给需要的 peer，减少重复采集与无效分发。
+- 强化安全边界：listener 和主动外连都支持 Bearer Token，调试输出会对 websocket token 做脱敏处理，避免敏感信息直接落日志。
+- 改善异常恢复与可观测性：单个 peer 的 reader / writer 可独立退出并收敛，session 会按生命周期完整清理，同时保留轻量调试日志与限频输出。
+- 提升可维护性：网络、协议、monitor、音频、shell、supervisor 等模块边界被重新梳理，后续扩展和排障成本更低。
 
 当前版本支持 3 种运行模式：
 
@@ -20,46 +36,15 @@
 
 ## 编译与运行
 
-### 本地构建
+这个程序依赖小爱音箱上的音频设备、`ubus`、`mphelper` 以及对应日志文件，不能在普通开发机环境中直接运行。推荐流程是：在开发机上交叉编译，再把生成的二进制拷贝到音箱里运行。
+
+### 在开发机上交叉编译
 
 ```bash
-cargo build
+make build
 ```
 
-### 运行方式
-
-仅主动连接：
-
-```bash
-cargo run -- ws://127.0.0.1:9000
-```
-
-仅监听：
-
-```bash
-cargo run -- -l
-```
-
-监听 + 主动连接：
-
-```bash
-cargo run -- -l ws://127.0.0.1:9000
-```
-
-开启调试日志时，`debug` 或 `-d` 可以和 `-l` / URL 任意组合：
-
-```bash
-cargo run -- -d -l ws://127.0.0.1:9000
-```
-
-命令行规则：
-
-- 语法：`client [debug|-d] [-l] [websocket_server_url]`
-- `-l` 开启监听模式，监听地址固定为 `0.0.0.0:4399`
-- `websocket_server_url` 在 connect-only 和 hybrid 模式下使用
-- 不允许既不传 `-l`，也不传 `websocket_server_url`
-
-### 交叉编译 ARMv7
+等价命令：
 
 ```bash
 cross build --release --target armv7-unknown-linux-gnueabihf
@@ -71,9 +56,51 @@ cross build --release --target armv7-unknown-linux-gnueabihf
 ./target/armv7-unknown-linux-gnueabihf/release/client
 ```
 
+### 在音箱上运行
+
+将上面的 `client` 二进制拷贝到小爱音箱后，再在音箱环境中执行。
+
+仅主动连接：
+
+```bash
+./client ws://your-websocket-server:4399
+```
+
+仅监听：
+
+```bash
+./client -l
+```
+
+监听 + 主动连接：
+
+```bash
+./client -l ws://your-websocket-server:4399
+```
+
+开启调试日志时，`debug` 或 `-d` 可以和 `-l` / URL 任意组合：
+
+```bash
+./client -d -l ws://your-websocket-server:4399
+```
+
+主动连接时附带 Bearer Token：
+
+```bash
+./client -t your-websocket-token ws://your-websocket-server:4399
+```
+
+命令行规则：
+
+- 语法：`client [debug|-d] [-l] [-t websocket_token] [websocket_server_url]`
+- `-l` 开启监听模式，监听地址固定为 `0.0.0.0:4399`
+- `-t websocket_token` 仅在主动连接方向使用，会以 Bearer Token 形式附带到握手请求
+- `websocket_server_url` 在 connect-only 和 hybrid 模式下使用
+- 不允许既不传 `-l`，也不传 `websocket_server_url`
+
 ## 外部依赖
 
-项目默认依赖以下设备侧命令或文件：
+项目默认依赖以下小爱音箱环境中的命令或文件：
 
 - `aplay`：播放 PCM 音频
 - `arecord`：采集 PCM 音频
@@ -87,44 +114,46 @@ cross build --release --target armv7-unknown-linux-gnueabihf
 ```text
 src/
 ├── main.rs
+├── config.rs             # CLI 解析、usage 与 RunConfig
 ├── app/
 │   ├── commands.rs        # session 级命令注册与本地能力装配
-│   ├── config.rs          # CLI 解析与 RunConfig
 │   ├── fanout.rs          # session 级共享设备、monitor 与录音 fanout 线程
+│   ├── mod.rs
 │   ├── session_peer.rs    # SessionRuntime、peer attach/detach、peer/router 退出事件
 │   ├── supervisor.rs      # 进程级编排与 SupervisorEvent 总线
-│   ├── ws_peer_hub.rs     # peer 表、广播/定向发送、录音订阅
 │   ├── ws_ingress.rs      # listener / connector 线程与外连状态闸门
-│   └── mod.rs
-├── protocol/
-│   ├── data.rs            # Event / Request / Response / Stream
-│   ├── registry.rs        # 本地命令注册表
-│   ├── router.rs          # 会话内统一分发线程
-│   └── mod.rs
-├── transport/
-│   ├── codec.rs           # 协议对象 <-> websocket frame
-│   ├── control.rs         # PeerId / PeerSource / SessionControl 等边界类型
-│   ├── ws_pump.rs         # 单 peer ws reader/writer 与建连/accept
-│   └── mod.rs
+│   └── ws_peer_hub.rs     # peer 表、广播/定向发送、录音订阅
+├── audio/
+│   ├── config.rs          # 统一音频参数与 AudioConfig
+│   ├── mod.rs
+│   ├── player.rs          # 本地 PCM 播放链路
+│   └── recorder.rs        # 本地 PCM 录音链路
+├── base/
+│   ├── debug.rs           # 轻量调试日志与限频输出
+│   ├── error.rs           # AppError 统一错误别名
+│   ├── mod.rs
+│   └── version.rs         # 编译期版本号
 ├── monitor/
 │   ├── file.rs            # 可停止的文件监听基础设施
-│   ├── instruction.rs
-│   ├── kws.rs
-│   ├── playing.rs
-│   └── mod.rs
-├── audio/
-│   ├── config.rs
-│   ├── player.rs
-│   ├── recorder.rs
-│   └── mod.rs
+│   ├── instruction.rs     # instruction monitor
+│   ├── kws.rs             # kws monitor
+│   ├── mod.rs
+│   └── playing.rs         # 播放状态 monitor
+├── protocol/
+│   ├── data.rs            # Event / Request / Response / Stream
+│   ├── mod.rs
+│   ├── registry.rs        # 本地命令注册表
+│   └── router.rs          # 会话内统一分发线程
 ├── shell/
-│   ├── command.rs
-│   └── mod.rs
-└── base/
-    ├── debug.rs
-    ├── error.rs
-    ├── version.rs
-    └── mod.rs
+│   ├── command.rs         # 本地 shell 命令执行与结果封装
+│   ├── device.rs          # 设备 MAC 读取与 listen code 生成
+│   ├── mod.rs
+│   └── speaker.rs         # 从旧项目迁移的设备控制方法备份（当前未接入编译链）
+└── transport/
+    ├── codec.rs           # 协议对象 <-> websocket frame
+    ├── control.rs         # PeerId / PeerSource / SessionControl 等边界类型
+    ├── mod.rs
+    └── ws_pump.rs         # 单 peer ws reader/writer 与建连/accept
 ```
 
 ## 核心架构
@@ -336,34 +365,76 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 
 ## 支持的远端命令
 
+当前版本实际注册并支持以下 6 个远端命令。除特别说明外，命令执行成功时返回标准 `Response(code=0, msg="success")`；命令不存在或执行失败时返回 `Response(code=-1, msg=...)`。
+
 ### `get_version`
 
-- 返回当前客户端版本号
+- 无需 `payload`
+- 返回当前客户端版本号，结果放在 `Response.data` 中
 
 ### `run_shell`
 
-- 通过 `/bin/sh -c` 执行服务端下发脚本
+- `payload` 需要是一个字符串，会通过 `/bin/sh -c` 在本机执行
 - 返回 `stdout`、`stderr`、`exit_code`
 
 ### `start_play`
 
-- 启动全局播放器
-- 可携带自定义 `AudioConfig`
+- `payload` 可选；如传入，则需要是 `AudioConfig`
+- 启动 client 自己管理的本地播放器
+- 仅影响由 `client-rust` 发起的 `aplay` 播放链路，不控制小爱音箱系统自身的播放状态
+- 该命令只负责启动播放链路；真正的音频数据仍通过入站 `Stream(tag="play")` 下发
 
 ### `stop_play`
 
-- 停止全局播放器
+- 无需 `payload`
+- 停止 client 自己管理的本地播放器
+- 仅停止由 `start_play` 启动的播放链路，不会停止小爱音箱系统自身的播放
 
 ### `start_recording`
 
+- `payload` 可选；如传入，则需要是 `AudioConfig`
 - 为当前 peer 建立录音订阅
-- 可携带自定义 `AudioConfig`
 - 首个活动订阅者决定本轮录音配置
+- 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回订阅该录音的 peer
 
 ### `stop_recording`
 
+- 无需 `payload`
 - 取消当前 peer 的录音订阅
 - 最后一个订阅者离开时才真正停录音
+
+## 客户端主动发送的事件与流
+
+当前版本会主动向远端发送 3 类文本 `Event` 和 1 类二进制 `Stream`。
+
+### `Event(event="instruction")`
+
+- 来源：`/tmp/mico_aivs_lab/instruction.log`
+- 发送范围：广播给当前 session 内所有 peer
+- 当文件被重置或重新开始读取时，`data` 形如 `"NewFile"`
+- 当读到新日志行时，`data` 形如 `{"NewLine":"<原始日志行>"}`
+- 为了兼容旧版服务端，客户端对 instruction 日志只做本地解析观测，真正发出去的仍然是上述兼容格式
+
+### `Event(event="kws")`
+
+- 来源：`/tmp/open-xiaoai/kws.log`
+- 发送范围：广播给当前 session 内所有 peer
+- 当唤醒服务启动时，`data` 形如 `"Started"`
+- 当捕获到唤醒词时，`data` 形如 `{"Keyword":"小爱同学"}`
+
+### `Event(event="playing")`
+
+- 来源：`ubus listen play_status_broadcast_event` + `ubus -t 5 call mediaplayer player_play_status`
+- 发送范围：广播给当前 session 内所有 peer
+- 只有播放状态发生变化时才会上报，避免重复发送
+- `data` 为字符串枚举：`"Playing"`、`"Paused"`、`"Idle"`
+
+### `Stream(tag="record")`
+
+- 来源：本地 `AudioRecorder`
+- 发送范围：只发给当前已订阅录音的 peer，不广播给所有 peer
+- 通过 WebSocket 二进制帧发送，负载是序列化后的协议 `Stream`
+- `bytes` 字段承载实际 PCM 音频数据，`data` 当前固定为空
 
 ## 生命周期总结
 
@@ -431,3 +502,11 @@ cargo test
 
 - 函数定义上方优先解释“这个函数在生命周期里承担什么职责”
 - 关键子函数调用前优先解释“每个入参为什么这么传、调用后希望得到什么结果”
+
+## 许可证
+
+本项目采用 [GNU General Public License v3.0 or later](./LICENSE) 授权发布。
+
+## 致谢
+
+感谢 [idootop](https://github.com/idootop) 过去在 `open-xiaoai` 和原始 `client-rust` 项目上的长期投入与贡献。这个重构版本能够继续往前走，离不开他此前在协议设计、功能验证和社区传播上打下的基础。

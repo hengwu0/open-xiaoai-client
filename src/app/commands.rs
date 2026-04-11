@@ -16,7 +16,7 @@ use crate::shell::command::run_shell;
 //
 // 入参说明：
 // - registry：当前 session 专属的命令注册表
-// - player：共享播放器实例，播放相关命令通过它控制设备播放
+// - player：共享播放器实例，播放相关命令通过它控制 client 自己拉起的本地播放链路
 // - recorder：共享录音器实例，录音相关命令通过它控制设备采集
 // - peer_hub：当前 session 的 peer/订阅管理中心
 // - record_output_writer：录音器产出的单路音频先写到这里，再交给 fanout 线程分发
@@ -64,7 +64,7 @@ pub(crate) fn register_session_commands(
     debug_log("supervisor", "Registering inbound command: start_play");
     // 参数说明：
     // - "start_play"：远端发起播放的命令名
-    // - move |_context, request| ...：读取可选 AudioConfig 并启动共享播放器
+    // - move |_context, request| ...：读取可选 AudioConfig 并启动 client 自己的共享播放器
     registry.register("start_play", {
         let player = player.clone();
         move |_context, request| {
@@ -88,7 +88,7 @@ pub(crate) fn register_session_commands(
     debug_log("supervisor", "Registering inbound command: stop_play");
     // 参数说明：
     // - "stop_play"：远端停止播放的命令名
-    // - move |_context, _request| ...：直接停止共享播放器
+    // - move |_context, _request| ...：直接停止 client 自己的共享播放器
     registry.register("stop_play", {
         let player = player.clone();
         move |_context, _request| {

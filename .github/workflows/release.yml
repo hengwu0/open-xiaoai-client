@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+env:
+  TARGET: armv7-unknown-linux-gnueabihf
+  BIN_NAME: client
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name }}
+
+      - name: Set up Rust stable
+        run: rustup default stable
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        run: make build
+
+      - name: Prepare release assets
+        run: |
+          cp "target/${TARGET}/release/${BIN_NAME}" client
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: client
+          retention-days: 7
+
+      - name: Upload binary to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" client --clobber
