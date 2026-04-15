@@ -7,10 +7,10 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
 
 use super::commands::register_session_commands;
-use super::fanout::{MediaDevices, MonitorHandles, spawn_record_fanout_thread};
+use super::fanout::MonitorHandles;
+use super::peer_media::PeerMediaRegistry;
 use super::supervisor::SupervisorEvent;
 use super::ws_peer_hub::WsPeerHub;
-use crate::audio::RecordOutputSender;
 use crate::base::{AppError, debug_log};
 use crate::protocol::registry::CommandRegistry;
 use crate::protocol::router::{RouterThread, spawn_router};
@@ -49,11 +49,9 @@ pub(crate) struct SessionRuntime {
     pub(crate) session_id: u64,
     route_channel_writer: mpsc::SyncSender<SessionControl>,
     peer_hub: Arc<WsPeerHub>,
-    devices: MediaDevices,
+    peer_media: Arc<PeerMediaRegistry>,
     peer_tasks: HashMap<PeerId, SessionPeer>,
     monitor_handles: MonitorHandles,
-    record_output_writer: RecordOutputSender,
-    fanout_handle: JoinHandle<()>,
 }
 
 impl SessionRuntime {
@@ -62,8 +60,7 @@ impl SessionRuntime {
     // 这里会一次性拉起：
     // - session 级 route_channel
     // - WsPeerHub
-    // - AudioPlayer / AudioRecorder
-    // - record-fanout-thread
+    // - per-peer 音频设备表
     // - router-thread
     // - instruction / playing / kws 三个 monitor
     //
@@ -77,41 +74,26 @@ impl SessionRuntime {
         let (route_channel_writer, route_channel_reader) =
             mpsc::sync_channel::<SessionControl>(256);
         let peer_hub = Arc::new(WsPeerHub::new());
-        let devices = MediaDevices::new();
-
-        let (record_output_writer_raw, record_output_reader) = mpsc::sync_channel::<Vec<u8>>(128);
-        let record_output_writer = RecordOutputSender::new(record_output_writer_raw);
-        // 参数说明：
-        // - peer_hub.clone()：fanout 线程通过它查询当前录音订阅者，并把音频分发出去
-        // - record_output_reader：接收 recorder 输出的 session 级单路录音数据
-        let fanout_handle = spawn_record_fanout_thread(peer_hub.clone(), record_output_reader);
+        let peer_media = Arc::new(PeerMediaRegistry::new());
 
         let registry = Arc::new(CommandRegistry::new());
         // 参数说明：
         // - &registry：本轮 session 专属的命令注册表
-        // - devices.player.clone()：共享播放器，供命令处理器调用
-        // - devices.recorder.clone()：共享录音器，供命令处理器调用
-        // - peer_hub.clone()：命令处理器通过它维护录音订阅集合
-        // - record_output_writer：录音输出先进入 session 级 fanout 队列
-        register_session_commands(
-            &registry,
-            devices.player.clone(),
-            devices.recorder.clone(),
-            peer_hub.clone(),
-            record_output_writer.clone(),
-        );
+        // - peer_media.clone()：命令处理器按 peer_id 找各自独立的 player / recorder
+        // - peer_hub.clone()：命令处理器通过它拿到当前 peer 的网络音频发送句柄
+        register_session_commands(&registry, peer_media.clone(), peer_hub.clone());
 
         // 参数说明：
         // - registry：本轮 session 的命令注册表，router 收到 Request 时通过它查 handler
         // - route_channel_reader：session 统一输入队列，收敛 monitor / ws-reader / supervisor 的消息
-        // - devices.player.clone()：收到入站播放流时交给共享播放器消费
+        // - peer_media.clone()：收到入站播放流时按来源 peer 路由到各自独立播放器
         // - peer_hub.clone()：router 通过它把 Response / Event / 广播消息继续分发给 peer
         let RouterThread {
             router_thread_handle,
         } = spawn_router(
             registry,
             route_channel_reader,
-            devices.player.clone(),
+            peer_media.clone(),
             peer_hub.clone(),
         )?;
         // 参数说明：
@@ -134,11 +116,9 @@ impl SessionRuntime {
             session_id,
             route_channel_writer,
             peer_hub,
-            devices,
+            peer_media,
             peer_tasks: HashMap::new(),
             monitor_handles,
-            record_output_writer,
-            fanout_handle,
         })
     }
 
@@ -179,13 +159,14 @@ impl SessionRuntime {
         // - peer_id：当前 peer 在 session 内的唯一编号
         // - source.clone()：保留该 peer 的来源，便于后续判断是否是 outbound peer
         // - control_sender.clone()：广播/单播控制消息最终通过它发给本 peer
-        // - audio_sender.clone()：录音 fanout 最终通过它发给本 peer
+        // - audio_sender.clone()：当前 peer 自己的 recorder 最终通过它把录音流发回本 peer
         self.peer_hub.add_peer(
             peer_id,
             source.clone(),
             control_sender.clone(),
             audio_sender.clone(),
         );
+        self.peer_media.add_peer(peer_id);
 
         // 参数说明：
         // - runtime_handle：让本 peer 的 reader / writer task 跑在 supervisor 管理的 tokio runtime 上
@@ -259,6 +240,7 @@ impl SessionRuntime {
             }
             Err(err) => {
                 let _ = self.peer_hub.remove_peer(peer_id);
+                let _ = self.peer_media.remove_peer(peer_id);
                 Err(err)
             }
         }
@@ -268,8 +250,8 @@ impl SessionRuntime {
     //
     // 注意这里不是整轮 session 关闭，而只是：
     // - 关闭该 peer 的 reader / writer
-    // - 从 WsPeerHub 删除它的发送句柄和录音订阅
-    // - 如果它刚好是最后一个录音订阅者，则停止 recorder
+    // - 从 WsPeerHub 和 PeerMediaRegistry 删除它的资源
+    // - 停掉这个 peer 自己的 player / recorder
     //
     // 入参说明：
     // - self：当前活跃 session 资源集合
@@ -286,15 +268,16 @@ impl SessionRuntime {
         if self.peer_hub.try_close_peer(peer_id) {
             std::thread::sleep(Duration::from_millis(200));
         }
+        if let Some(media) = self.peer_media.remove_peer(peer_id) {
+            let _ = media.recorder.stop_recording();
+            let _ = media.player.stop();
+        }
         // 参数说明：
         // - peer.handle.close()：如果优雅 close 没能让本地任务完全退出，这里做强制关闭兜底
         peer.handle.close();
         let Some(removal) = self.peer_hub.remove_peer(peer_id) else {
             return Ok(None);
         };
-        if removal.stop_recording {
-            self.devices.recorder.stop_recording()?;
-        }
 
         debug_log(
             "supervisor",
@@ -341,12 +324,12 @@ impl SessionRuntime {
         // 参数说明：
         // - SessionControl::Close：通知 router 主动结束当前 session 总线
         let _ = self.route_channel_writer.send(SessionControl::Close);
-        let _ = self.devices.recorder.stop_recording();
-        self.record_output_writer.close();
-        let _ = self.devices.player.stop();
+        for media in self.peer_media.drain() {
+            let _ = media.recorder.stop_recording();
+            let _ = media.player.stop();
+        }
 
         self.monitor_handles.join();
-        let _ = self.fanout_handle.join();
 
         debug_log(
             "supervisor",

@@ -1,9 +1,7 @@
-use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
-use crate::app::ws_peer_hub::WsPeerHub;
-use crate::audio::{AudioPlayer, AudioRecorder};
-use crate::base::{AppError, debug_err_log, debug_log};
+use crate::base::{AppError, debug_err_log};
 use crate::monitor::{
     FileMonitorHandle,
     instruction::spawn_instruction_monitor,
@@ -11,29 +9,6 @@ use crate::monitor::{
     playing::{PlayingMonitorHandle, spawn_playing_monitor},
 };
 use crate::transport::SessionControl;
-
-// MediaDevices 表示一轮 session 内共享的本地音频设备句柄。
-//
-// 它们不属于某个具体 peer，而是整轮 session 共享：
-// - player 负责消费远端下发的播放流
-// - recorder 负责产生本地录音流
-pub(crate) struct MediaDevices {
-    pub(crate) player: Arc<AudioPlayer>,
-    pub(crate) recorder: Arc<AudioRecorder>,
-}
-
-impl MediaDevices {
-    // 创建一组新的 session 级音频设备句柄。
-    //
-    // 入参说明：
-    // - 无
-    pub(crate) fn new() -> Self {
-        Self {
-            player: Arc::new(AudioPlayer::new()),
-            recorder: Arc::new(AudioRecorder::new()),
-        }
-    }
-}
 
 // MonitorHandles 用来统一托管一轮 session 内启动的 monitor 线程句柄。
 pub(crate) struct MonitorHandles {
@@ -86,31 +61,6 @@ impl MonitorHandles {
         join_monitor_thread("playing", playing.join());
         join_monitor_thread("kws", kws.join());
     }
-}
-
-// 启动录音 fanout 线程。
-//
-// recorder 只负责产出单路音频块；
-// fanout 线程负责根据 WsPeerHub 里的订阅集合，把音频复制给需要的 peer。
-//
-// 入参说明：
-// - peer_hub：当前 session 的 peer 集合和录音订阅表
-// - record_output_reader：接收 recorder 单路输出的 session 级录音队列
-pub(crate) fn spawn_record_fanout_thread(
-    peer_hub: Arc<WsPeerHub>,
-    record_output_reader: mpsc::Receiver<Vec<u8>>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("record-fanout-thread".to_string())
-        .spawn(move || {
-            while let Ok(payload) = record_output_reader.recv() {
-                // 参数说明：
-                // - payload：recorder 产出的单块录音数据
-                peer_hub.fan_out_record_audio(payload);
-            }
-            debug_log("supervisor", "Record fanout thread exited");
-        })
-        .expect("spawn record fanout thread")
 }
 
 // 统一 join monitor 线程，并在异常退出时补充分级日志。

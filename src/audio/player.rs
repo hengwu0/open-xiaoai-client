@@ -49,7 +49,7 @@ impl AudioPlayer {
     // - 一个内部小缓冲队列
     //
     // 入参说明：
-    // - self：当前共享播放器实例
+    // - self：当前 peer 自己的播放器实例
     // - config：可选播放配置；为空时退回全局默认 AUDIO_CONFIG
     pub fn start(&self, config: Option<AudioConfig>) -> Result<(), AppError> {
         // 每次重新 start 都先做一次完整 stop，避免遗留旧的 aplay 进程和写线程。
@@ -140,7 +140,7 @@ impl AudioPlayer {
     // 它不会直接写 aplay.stdin，而是交给独立播放线程处理，避免阻塞调用方。
     //
     // 入参说明：
-    // - self：当前共享播放器实例
+    // - self：当前 peer 自己的播放器实例
     // - bytes：一块待播放的 PCM 原始字节
     pub fn enqueue(&self, bytes: Vec<u8>) -> Result<(), AppError> {
         // 播放未启动时静默忽略，避免因为时序问题让上层直接失败。
@@ -185,7 +185,7 @@ impl AudioPlayer {
     // 3. 回收 aplay 子进程和 stdin
     //
     // 入参说明：
-    // - self：当前共享播放器实例
+    // - self：当前 peer 自己的播放器实例
     pub fn stop(&self) -> Result<(), AppError> {
         // 先断开发送端，让写线程自然退出，再回收线程和子进程。
         // 这个顺序比“先 kill 子进程，再停写线程”更稳，

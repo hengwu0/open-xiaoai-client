@@ -1,8 +1,8 @@
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
+use crate::app::peer_media::PeerMediaRegistry;
 use crate::app::ws_peer_hub::WsPeerHub;
-use crate::audio::AudioPlayer;
 use crate::base::{AppError, debug_err_log, debug_log};
 use crate::protocol::registry::{CommandContext, CommandRegistry};
 use crate::transport::{OutboundControl, OutboundTarget, RoutedOutbound, SessionControl};
@@ -35,18 +35,18 @@ pub struct RouterThread {
 // 入参说明：
 // - registry：本地命令注册表；处理入站 Request 时从这里查找对应 handler
 // - route_channel_reader：router 的统一输入队列
-// - player：本地播放器；收到 `tag=play` 的入站流时把音频交给它
+// - peer_media：当前 session 的 per-peer 音频设备表
 // - peer_hub：当前 session 内所有 peer 的统一出站分发器
 pub fn spawn_router(
     registry: Arc<CommandRegistry>,
     route_channel_reader: mpsc::Receiver<SessionControl>,
-    player: Arc<AudioPlayer>,
+    peer_media: Arc<PeerMediaRegistry>,
     peer_hub: Arc<WsPeerHub>,
 ) -> Result<RouterThread, AppError> {
     // 参数说明：
     // - registry：本轮 session 的命令表，收到 Request 时从这里查 handler
     // - route_channel_reader：router 的统一输入队列，收敛 monitor / ws-reader / supervisor 的消息
-    // - player：收到 `tag=play` 的入站流时，把音频字节交给本地播放器
+    // - peer_media：收到命令或播放流时，用 peer_id 找到对应的本地播放器
     // - peer_hub：router 通过它做广播或单播，不直接碰 websocket
     let router_thread_handle = thread::Builder::new()
         .name("router-thread".to_string())
@@ -129,13 +129,20 @@ pub fn spawn_router(
                         }
                         crate::transport::InboundMessage::Stream(stream) => {
                             if stream.tag == "play" {
-                                // 当前入站流里真正会被消费的只有播放流。
-                                // 因此这里直接把字节交给 AudioPlayer，不再额外引入更泛化的流调度器。
-                                debug_log("router", format!("Inbound play stream received: id={}, bytes={}", stream.id, stream.bytes.len()));
-                                // 参数说明：
-                                // - stream.bytes：服务端下发的 PCM 播放数据
-                                // - player.enqueue(stream.bytes)：把播放数据交给本地 aplay 写线程
-                                player.enqueue(stream.bytes)?;
+                                // 当前播放流按 peer 隔离：
+                                // 谁发来的 `tag=play`，就只进谁自己的 AudioPlayer。
+                                debug_log("router", format!("Inbound play stream received: peer={}, id={}, bytes={}", inbound.peer_id, stream.id, stream.bytes.len()));
+                                if let Some(media) = peer_media.get(inbound.peer_id) {
+                                    media.player.enqueue(stream.bytes)?;
+                                } else {
+                                    debug_log(
+                                        "router",
+                                        format!(
+                                            "Dropping play stream because peer media is gone: peer={}, id={}",
+                                            inbound.peer_id, stream.id
+                                        ),
+                                    );
+                                }
                             }
                         }
                     },

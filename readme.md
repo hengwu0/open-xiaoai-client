@@ -13,9 +13,9 @@
 ### 当前版本的重点改进
 
 - 大幅降低 CPU 占用：将 client 程序的 CPU 占用从旧版本接近 `100%` 的常驻占用，优化到约 `1%` 的日常占用水平。
-- 重做 `session` 生命周期：`session` 不再绑定单个 WebSocket 连接，而是绑定一组共享播放器、录音器、monitor 和 router 的 peer 集合，资源创建与回收更清晰。
+- 重做 `session` 生命周期：`session` 不再绑定单个 WebSocket 连接，而是绑定一组共享 router、monitor 与网络出口、但按 peer 隔离音频设备的对端集合，资源创建与回收更清晰。
 - 支持更稳定的多连接模型：除 `connect-only` 外，还支持 `listen-only` 和 `hybrid` 模式，监听与主动重连常驻运行，不因单个 peer 波动打断整轮服务。
-- 优化音频分发路径：录音只保留单路采集，再按订阅关系 fanout 给需要的 peer，减少重复采集与无效分发。
+- 优化音频隔离语义：播放和录音都改为按 peer 独立管理，避免多对端之间共享同一条本地音频链路。
 - 强化安全边界：listener 和主动外连都支持 Bearer Token，调试输出会对 websocket token 做脱敏处理，避免敏感信息直接落日志。
 - 改善异常恢复与可观测性：单个 peer 的 reader / writer 可独立退出并收敛，session 会按生命周期完整清理，同时保留轻量调试日志与限频输出。
 - 提升可维护性：网络、协议、monitor、音频、shell、supervisor 等模块边界被重新梳理，后续扩展和排障成本更低。
@@ -26,12 +26,12 @@
 - `listen-only`：监听 `0.0.0.0:4399`，等待远端连入
 - `hybrid`：既监听 `4399`，又在后台持续重试主动连接 `websocket_server_url`
 
-和旧版不同，当前的 `session` 不再等同于“单个 ws 连接”，而是等同于“一组共享本地设备、router、monitor 的对端集合”：
+和旧版不同，当前的 `session` 不再等同于“单个 ws 连接”，而是等同于“一组共享 router、monitor 和网络出口，但每个 peer 自带独立 player / recorder 的对端集合”：
 
 - 第一个 peer 接入时创建 session
 - 本地 `Event` 会广播给当前所有 peer
 - 某个 peer 发来的 `Request` 只会回给该 peer 自己
-- 录音流只会发给发起 `start_recording` 的 peer 集合
+- 每个发起 `start_recording` 的 peer 只会收到自己对应 recorder 产出的录音流
 - 最后一个 peer 退出时，session 会完整清理并回到监听 / 外连重试空闲态
 
 ## 编译与运行
@@ -117,12 +117,13 @@ src/
 ├── config.rs             # CLI 解析、usage 与 RunConfig
 ├── app/
 │   ├── commands.rs        # session 级命令注册与本地能力装配
-│   ├── fanout.rs          # session 级共享设备、monitor 与录音 fanout 线程
+│   ├── fanout.rs          # session 级 monitor 句柄托管
 │   ├── mod.rs
-│   ├── session_peer.rs    # SessionRuntime、peer attach/detach、peer/router 退出事件
+│   ├── peer_media.rs      # per-peer 本地播放器/录音器注册表
+│   ├── session.rs         # SessionRuntime、peer attach/detach、peer/router 退出事件
 │   ├── supervisor.rs      # 进程级编排与 SupervisorEvent 总线
 │   ├── ws_ingress.rs      # listener / connector 线程与外连状态闸门
-│   └── ws_peer_hub.rs     # peer 表、广播/定向发送、录音订阅
+│   └── ws_peer_hub.rs     # peer 表、广播/定向发送、peer 音频发送句柄
 ├── audio/
 │   ├── config.rs          # 统一音频参数与 AudioConfig
 │   ├── mod.rs
@@ -169,10 +170,11 @@ src/
 当前 `app` 目录的职责分层如下：
 
 - `supervisor.rs`：承载进程级状态机、`SupervisorEvent` 总线，以及“何时创建/销毁 session”的决策逻辑
-- `session_peer.rs`：承载 `SessionRuntime`、peer attach/detach、peer/router 退出等待逻辑
-- `ws_peer_hub.rs`：承载 session 内所有网络出口抽象，包括广播、单播、录音订阅集合
-- `fanout.rs`：承载 `MediaDevices`、`MonitorHandles` 与录音 fanout 线程
-- `commands.rs`：承载命令注册，把本地播放器、录音器、shell 等能力装配到 registry
+- `session.rs`：承载 `SessionRuntime`、peer attach/detach、peer/router 退出等待逻辑
+- `ws_peer_hub.rs`：承载 session 内所有网络出口抽象，包括广播、单播和每个 peer 的音频发送句柄
+- `fanout.rs`：承载 `MonitorHandles`
+- `peer_media.rs`：承载 per-peer 的 `AudioPlayer` / `AudioRecorder`
+- `commands.rs`：承载命令注册，把 per-peer 播放器、录音器、shell 等能力装配到 registry
 - `ws_ingress.rs`：承载 listener / connector 线程，以及 `ConnectServerStatus`
 
 ### 2. 短生命周期 session
@@ -180,13 +182,15 @@ src/
 一个 session 内共享以下资源：
 
 - `router-thread`
-- `AudioPlayer`
-- `AudioRecorder`
 - `WsPeerHub`
 - `instruction / playing / kws` 三个 monitor
-- `record-fanout-thread`
 
-第一个 peer 接入时创建这些资源；最后一个 peer 离开时统一回收。
+同时，每个 peer 会独立持有：
+
+- `AudioPlayer`
+- `AudioRecorder`
+
+第一个 peer 接入时创建 session 级资源；每个 peer attach 时再创建它自己的 player / recorder；最后一个 peer 离开时统一回收。
 
 ### 3. 每个 peer 的独立网络收发
 
@@ -209,11 +213,11 @@ src/
 
 可以把这 5 个对象理解成“资源层”“连接层”“事件层”“外连闸门层”“网络出口层”：
 
-- `SessionRuntime`：表示一轮活跃 session，内部持有 `router`、`AudioPlayer`、`AudioRecorder`、`WsPeerHub`、monitor、fanout 线程等共享资源
+- `SessionRuntime`：表示一轮活跃 session，内部持有 `router`、`WsPeerHub`、per-peer 媒体注册表、monitor 等资源
 - `peer`：表示一个已经挂入当前 session 的 websocket 对端；一个 session 可以同时有多个 peer，但一个 peer 只属于当前这一轮 session
 - `SupervisorEvent`：supervisor 的统一事件总线；listener、connector、peer waiter、router waiter 都通过它把变化回报给 `AppSupervisor`
 - `ConnectServerStatus`：只服务于主动外连那一路，用来保证同一时刻最多只有一个“已连接的 outbound peer”
-- `WsPeerHub`：session 内统一的网络出口抽象；router、命令处理器、录音 fanout 都通过它做 peer 级分发
+- `WsPeerHub`：session 内统一的网络出口抽象；router、命令处理器和 per-peer recorder 都通过它找到目标 peer 的发送队列
 
 关系图如下：
 
@@ -229,7 +233,8 @@ listener / connector
 SessionRuntime
   -> 管理当前 session 内的全部 peer
   -> 为每个 peer 启动独立的 ws-reader / ws-writer
-  -> 共享 router / recorder / player / monitor / WsPeerHub
+  -> 共享 router / monitor / WsPeerHub
+  -> 为每个 peer 分配独立的 AudioPlayer / AudioRecorder
 
 peer 或 router 退出
   -> waiter 发送 SupervisorEvent::PeerTaskExited / RouterExited
@@ -334,25 +339,23 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 本地 `instruction` / `playing` / `kws` 事件：广播
 - `Request` 的 `Response`：回给原始 peer
 - 入站 `Stream(tag="play")`：只做本地播放，不回网
-- 录音 `Stream(tag="record")`：只发给录音订阅者
+- 录音 `Stream(tag="record")`：只回给当前发起录音的 peer 自己
 
 ## 录音语义
 
-录音不是“每个 peer 一个 recorder”，而是“session 里一个全局 recorder + 多个订阅者”。
+录音现在是“每个 peer 一个 recorder”，不再共享 session 级全局录音器。
 
 `start_recording` 行为：
 
-- 第一个订阅者启动真正的 `AudioRecorder`
-- 第一条生效请求锁定本轮 `AudioConfig`
-- 后续 peer 如果配置相同，加入订阅集合
-- 后续 peer 如果配置不同，返回错误
-- 同一 peer 重复 `start_recording` 按幂等处理
+- 只启动当前 peer 自己的 `AudioRecorder`
+- 当前 peer 再次发起 `start_recording` 时，会先停掉旧的 `arecord`，再按新请求重新拉起
+- 当前 peer 的录音数据只会回给当前 peer
 
 `stop_recording` 行为：
 
-- 只移除当前 peer 的订阅
-- 当最后一个订阅者离开时，真正停止 recorder
-- peer 断线时也会自动移除它的录音订阅
+- 只停止当前 peer 自己的 recorder
+- 不会影响其他 peer 的录音状态
+- peer 断线时也会自动停止它自己的 recorder
 
 ## monitor 生命周期
 
@@ -381,6 +384,7 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 
 - `payload` 可选；如传入，则需要是 `AudioConfig`
 - 启动 client 自己管理的本地播放器
+- 当前 peer 再次发起 `start_play` 时，会先停掉旧的 `aplay` 链路，再按新配置重启
 - 仅影响由 `client-rust` 发起的 `aplay` 播放链路，不控制小爱音箱系统自身的播放状态
 - 该命令只负责启动播放链路；真正的音频数据仍通过入站 `Stream(tag="play")` 下发
 
@@ -393,15 +397,14 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 ### `start_recording`
 
 - `payload` 可选；如传入，则需要是 `AudioConfig`
-- 为当前 peer 建立录音订阅
-- 首个活动订阅者决定本轮录音配置
-- 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回订阅该录音的 peer
+- 启动当前 peer 自己的本地录音链路
+- 当前 peer 再次发起 `start_recording` 时，会先停掉旧录音链路，再按新配置重启
+- 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回该 peer 自己
 
 ### `stop_recording`
 
 - 无需 `payload`
-- 取消当前 peer 的录音订阅
-- 最后一个订阅者离开时才真正停录音
+- 停止当前 peer 自己的录音链路
 
 ## 客户端主动发送的事件与流
 
@@ -432,7 +435,7 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 ### `Stream(tag="record")`
 
 - 来源：本地 `AudioRecorder`
-- 发送范围：只发给当前已订阅录音的 peer，不广播给所有 peer
+- 发送范围：只发给当前启动该 recorder 的 peer，不广播给所有 peer
 - 通过 WebSocket 二进制帧发送，负载是序列化后的协议 `Stream`
 - `bytes` 字段承载实际 PCM 音频数据，`data` 当前固定为空
 
@@ -484,7 +487,7 @@ cargo test
 
 - CLI 解析
 - `WsPeerHub` 的广播 / 定向发送
-- 录音订阅与配置冲突语义
+- per-peer 媒体路由的基础语义
 - 现有协议编解码与事件格式兼容性
 
 ## 阅读建议
@@ -493,10 +496,11 @@ cargo test
 
 1. `main.rs`：先理解程序入口如何解析配置并启动 `AppSupervisor`
 2. `app/supervisor.rs`：理解进程级主循环、`SupervisorEvent` 总线，以及 session 何时创建/销毁
-3. `app/session_peer.rs`：理解单轮 session 内部有哪些共享资源，以及 peer attach/detach 的过程
-4. `app/ws_peer_hub.rs`：理解广播、单播、录音订阅和 peer 表是如何统一管理的
+3. `app/session.rs`：理解单轮 session 内部有哪些 session 级资源、每个 peer 自己有哪些本地设备，以及 peer attach/detach 的过程
+4. `app/ws_peer_hub.rs`：理解广播、单播和 peer 音频发送句柄是如何统一管理的
 5. `protocol/router.rs`：理解入站请求、本地命令执行、回包和出站分发
-6. `app/ws_ingress.rs`：理解 listener / connector 如何把“已握手成功的 peer”送回 supervisor
+6. `app/peer_media.rs`：理解 per-peer 的 `AudioPlayer` / `AudioRecorder` 是如何注册和回收的
+7. `app/ws_ingress.rs`：理解 listener / connector 如何把“已握手成功的 peer”送回 supervisor
 
 当前源码里的中文注释遵循两个原则：
 

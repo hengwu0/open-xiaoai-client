@@ -1,12 +1,13 @@
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::{AUDIO_CONFIG, AudioConfig};
 use crate::base::{AppError, debug_err_log, debug_log, debug_log_limited};
 use crate::protocol::Stream;
+use crate::transport::NotifyingSender;
 
 const A113_CAPTURE_BITS_PER_SAMPLE: u16 = 32;
 
@@ -25,58 +26,6 @@ pub struct AudioRecorder {
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
-// RecordOutputSender 是 session 级录音输出队列的可关闭发送端包装。
-//
-// 这里不直接把 `SyncSender<Vec<u8>>` 到处 clone 出去，而是把真正的 sender 收敛到
-// 一个共享 `Option` 里。这样 session shutdown 时只需要调用一次 `close()`，
-// 就能让所有持有这个包装器的地方同时失去发送能力，并触发接收端感知到 channel 断开。
-#[derive(Clone)]
-pub(crate) struct RecordOutputSender {
-    inner: Arc<Mutex<Option<mpsc::SyncSender<Vec<u8>>>>>,
-}
-
-impl RecordOutputSender {
-    // new 创建一个可关闭的录音输出发送端包装。
-    //
-    // 入参说明：
-    // - sender：底层 session 级录音输出队列发送端
-    pub(crate) fn new(sender: mpsc::SyncSender<Vec<u8>>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Some(sender))),
-        }
-    }
-
-    // close 关闭当前录音输出发送能力。
-    //
-    // 关闭后，后续所有 try_send 都会表现为 disconnected。
-    //
-    // 入参说明：
-    // - self：当前 RecordOutputSender 包装器
-    pub(crate) fn close(&self) {
-        if let Ok(mut sender) = self.inner.lock() {
-            let _ = sender.take();
-        }
-    }
-
-    // try_send 尝试把一块录音负载发到 session 级录音输出队列。
-    //
-    // 它保留 sync_channel 的非阻塞语义：队列满时直接返回 Full，调用方自行决定是否丢帧。
-    //
-    // 入参说明：
-    // - self：当前 RecordOutputSender 包装器
-    // - payload：一块已经编码好的录音流数据
-    pub(crate) fn try_send(&self, payload: Vec<u8>) -> Result<(), mpsc::TrySendError<Vec<u8>>> {
-        let sender = match self.inner.lock() {
-            Ok(sender) => sender,
-            Err(_) => return Err(mpsc::TrySendError::Disconnected(payload)),
-        };
-        let Some(sender) = sender.as_ref() else {
-            return Err(mpsc::TrySendError::Disconnected(payload));
-        };
-        sender.try_send(payload)
-    }
-}
-
 impl AudioRecorder {
     // new 创建一个尚未启动的录音器实例。
     //
@@ -93,28 +42,23 @@ impl AudioRecorder {
     // start_recording 按给定配置启动本地录音链路。
     //
     // 它会：
+    // 0. 如果当前 peer 已经在录音，则先完整停止旧录音链路
     // 1. 确定业务请求配置和底层真实采集配置
     // 2. 拉起 arecord 子进程
     // 3. 启动一个录音线程持续读取 stdout
-    // 4. 把录到的 PCM 聚合、必要时转换并编码成 Stream，再投到 session 输出队列
+    // 4. 把录到的 PCM 聚合、必要时转换并编码成 Stream，再投到当前 peer 的音频输出队列
     //
     // 入参说明：
-    // - self：当前共享录音器实例
+    // - self：当前 peer 自己的录音器实例
     // - config：可选业务录音配置；为空时退回全局默认 AUDIO_CONFIG
-    // - audio_output：session 级录音输出发送端，录音线程会把编码后的 payload 发到这里
+    // - audio_output：当前 peer 的音频输出发送端，录音线程会把编码后的 payload 发到这里
     pub fn start_recording(
         &self,
         config: Option<AudioConfig>,
-        audio_output: RecordOutputSender,
+        audio_output: NotifyingSender<Vec<u8>>,
     ) -> Result<(), AppError> {
-        // 已经在录音时直接复用当前会话，避免重复拉起 arecord。
-        if self.task.lock().expect("recorder task poisoned").is_some() {
-            debug_log(
-                "audio-recorder",
-                "start_recording ignored because recorder is already active",
-            );
-            return Ok(());
-        }
+        // 和播放器保持一致：重复 start_recording 时，先停旧链路，再按新配置重启。
+        self.stop_recording()?;
         let requested = config.unwrap_or_else(|| (*AUDIO_CONFIG).clone());
         // 某些设备实际采集格式与请求格式不一致，这里先算出底层采集参数。
         let capture = capture_config_for_recording(&requested);
@@ -143,7 +87,7 @@ impl AudioRecorder {
         // - stdout：arecord 的标准输出，持续产出原始 PCM 数据
         // - requested：业务层真正期望的输出格式
         // - capture：底层真实采集格式，用于决定是否需要转换
-        // - audio_output：编码后的录音块最终写到 session 级 fanout 队列
+        // - audio_output：编码后的录音块最终直接写到当前 peer 的音频队列
         let handle = thread::Builder::new().name("audio-recorder-thread".to_string()).spawn(move || {
             let mut dropped_audio_frames = 0_u64;
             // 底层按 period_size 读数据，但对外按 buffer_size 聚合后再发，减少消息碎片。
@@ -192,7 +136,7 @@ impl AudioRecorder {
                                 let payload = serde_json::to_vec(&Stream::new("record", bytes, None)).unwrap();
                                 // 队列满时不阻塞录音线程，而是记一次丢帧统计。
                                 // 参数说明：
-                                // - audio_output.try_send(payload)：尝试把录音块投递给 session fanout 队列
+                                // - audio_output.try_send(payload)：尝试把录音块投递给当前 peer 的音频队列
                                 match audio_output.try_send(payload) {
                                     Ok(()) => {}
                                     Err(mpsc::TrySendError::Full(_payload)) => {
@@ -224,7 +168,7 @@ impl AudioRecorder {
     // 它会先结束 arecord 子进程，再等待录音线程自然退出。
     //
     // 入参说明：
-    // - self：当前共享录音器实例
+    // - self：当前 peer 自己的录音器实例
     pub fn stop_recording(&self) -> Result<(), AppError> {
         // 录音停止时先结束子进程，再等待线程退出。
         // 因为线程本身依赖 arecord.stdout 持续读数据，子进程结束后它会自然走到退出路径。

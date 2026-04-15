@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use super::ws_peer_hub::{RecordingSubscription, WsPeerHub};
-use crate::audio::{AudioPlayer, AudioRecorder, RecordOutputSender};
+use super::peer_media::PeerMediaRegistry;
+use super::ws_peer_hub::WsPeerHub;
 use crate::base::{VERSION, debug_log};
 use crate::protocol::Response;
 use crate::protocol::registry::CommandRegistry;
@@ -16,16 +16,12 @@ use crate::shell::command::run_shell;
 //
 // 入参说明：
 // - registry：当前 session 专属的命令注册表
-// - player：共享播放器实例，播放相关命令通过它控制 client 自己拉起的本地播放链路
-// - recorder：共享录音器实例，录音相关命令通过它控制设备采集
-// - peer_hub：当前 session 的 peer/订阅管理中心
-// - record_output_writer：录音器产出的单路音频先写到这里，再交给 fanout 线程分发
+// - peer_media：当前 session 的 per-peer 音频设备表
+// - peer_hub：当前 session 的 peer 网络出口管理中心
 pub(crate) fn register_session_commands(
     registry: &Arc<CommandRegistry>,
-    player: Arc<AudioPlayer>,
-    recorder: Arc<AudioRecorder>,
+    peer_media: Arc<PeerMediaRegistry>,
     peer_hub: Arc<WsPeerHub>,
-    record_output_writer: RecordOutputSender,
 ) {
     // 这张表定义的是“远端能驱动本机做什么”。
     // 约束保持不变：
@@ -64,10 +60,10 @@ pub(crate) fn register_session_commands(
     debug_log("supervisor", "Registering inbound command: start_play");
     // 参数说明：
     // - "start_play"：远端发起播放的命令名
-    // - move |_context, request| ...：读取可选 AudioConfig 并启动 client 自己的共享播放器
+    // - move |context, request| ...：读取可选 AudioConfig 并启动当前 peer 自己的播放器
     registry.register("start_play", {
-        let player = player.clone();
-        move |_context, request| {
+        let peer_media = peer_media.clone();
+        move |context, request| {
             let config = request
                 .payload
                 .and_then(|payload| serde_json::from_value(payload).ok());
@@ -78,9 +74,10 @@ pub(crate) fn register_session_commands(
                     config.is_some()
                 ),
             );
-            // 参数说明：
-            // - config：如果 payload 能解析成 AudioConfig，就按该配置启动播放器
-            player.start(config)?;
+            let media = peer_media
+                .get(context.peer_id)
+                .ok_or_else(|| anyhow::anyhow!("peer media not found: {}", context.peer_id))?;
+            media.player.start(config)?;
             Ok(Response::success())
         }
     });
@@ -88,24 +85,32 @@ pub(crate) fn register_session_commands(
     debug_log("supervisor", "Registering inbound command: stop_play");
     // 参数说明：
     // - "stop_play"：远端停止播放的命令名
-    // - move |_context, _request| ...：直接停止 client 自己的共享播放器
+    // - move |context, _request| ...：直接停止当前 peer 自己的播放器
     registry.register("stop_play", {
-        let player = player.clone();
-        move |_context, _request| {
-            debug_log("supervisor", "Executing inbound command stop_play");
-            player.stop()?;
+        let peer_media = peer_media.clone();
+        move |context, _request| {
+            debug_log(
+                "supervisor",
+                format!(
+                    "Executing inbound command stop_play; peer={}",
+                    context.peer_id
+                ),
+            );
+            let media = peer_media
+                .get(context.peer_id)
+                .ok_or_else(|| anyhow::anyhow!("peer media not found: {}", context.peer_id))?;
+            media.player.stop()?;
             Ok(Response::success())
         }
     });
 
     debug_log("supervisor", "Registering inbound command: start_recording");
     // 参数说明：
-    // - "start_recording"：远端开始录音订阅的命令名
-    // - move |context, request| ...：根据请求方 peer_id 和可选配置维护录音订阅
+    // - "start_recording"：远端启动当前 peer 本地录音的命令名
+    // - move |context, request| ...：按当前 peer 的独立 recorder 启动录音
     registry.register("start_recording", {
-        let recorder = recorder.clone();
+        let peer_media = peer_media.clone();
         let peer_hub = peer_hub.clone();
-        let record_output_writer = record_output_writer.clone();
         move |context, request| {
             let config = request
                 .payload
@@ -118,31 +123,23 @@ pub(crate) fn register_session_commands(
                     config.is_some()
                 ),
             );
-            // 参数说明：
-            // - context.peer_id：当前发起 start_recording 的对端
-            // - config：本次请求携带的录音配置，可能为空
-            // - peer_hub.subscribe_recording(...)：统一决定这次请求是首个订阅还是幂等复用
-            match peer_hub.subscribe_recording(context.peer_id, config)? {
-                RecordingSubscription::Start(active_config) => {
-                    // 只有首个订阅者才真正启动全局 recorder。
-                    // 参数说明：
-                    // - Some(active_config)：本轮被锁定下来的录音配置
-                    // - record_output_writer.clone()：recorder 输出先进入 session 级 fanout 队列
-                    recorder.start_recording(Some(active_config), record_output_writer.clone())?;
-                }
-                RecordingSubscription::AlreadyActive => {}
-            }
+            let media = peer_media
+                .get(context.peer_id)
+                .ok_or_else(|| anyhow::anyhow!("peer media not found: {}", context.peer_id))?;
+            let audio_sender = peer_hub.audio_sender(context.peer_id).ok_or_else(|| {
+                anyhow::anyhow!("peer audio sender not found: {}", context.peer_id)
+            })?;
+            media.recorder.start_recording(config, audio_sender)?;
             Ok(Response::success())
         }
     });
 
     debug_log("supervisor", "Registering inbound command: stop_recording");
     // 参数说明：
-    // - "stop_recording"：远端取消录音订阅的命令名
-    // - move |context, _request| ...：移除当前 peer 的录音订阅，必要时停掉 recorder
+    // - "stop_recording"：远端停止当前 peer 本地录音的命令名
+    // - move |context, _request| ...：停止当前 peer 自己的 recorder
     registry.register("stop_recording", {
-        let recorder = recorder.clone();
-        let peer_hub = peer_hub.clone();
+        let peer_media = peer_media.clone();
         move |context, _request| {
             debug_log(
                 "supervisor",
@@ -151,11 +148,10 @@ pub(crate) fn register_session_commands(
                     context.peer_id
                 ),
             );
-            // 参数说明：
-            // - peer_hub.unsubscribe_recording(context.peer_id)：移除当前 peer 的录音订阅
-            if peer_hub.unsubscribe_recording(context.peer_id) {
-                recorder.stop_recording()?;
-            }
+            let media = peer_media
+                .get(context.peer_id)
+                .ok_or_else(|| anyhow::anyhow!("peer media not found: {}", context.peer_id))?;
+            media.recorder.stop_recording()?;
             Ok(Response::success())
         }
     });

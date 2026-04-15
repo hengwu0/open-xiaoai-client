@@ -9,4 +9,3 @@ pub mod recorder;
 pub use config::{AUDIO_CONFIG, AudioConfig};
 pub use player::AudioPlayer;
 pub use recorder::AudioRecorder;
-pub(crate) use recorder::RecordOutputSender;

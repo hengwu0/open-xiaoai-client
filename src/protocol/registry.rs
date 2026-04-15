@@ -18,7 +18,7 @@ use super::{Request, Response};
 pub struct CommandContext {
     // 当前 request 是由哪个 peer 发来的。
     // 加上这个上下文后，handler 就能做：
-    // - per-peer 录音订阅
+    // - per-peer 播放 / 录音控制
     // - 将来的权限隔离或来源统计
     pub peer_id: PeerId,
 }
