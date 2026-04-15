@@ -24,8 +24,8 @@ pub struct AudioConfig {
 pub static AUDIO_CONFIG: LazyLock<AudioConfig> = LazyLock::new(|| AudioConfig {
     pcm: "noop".into(),
     channels: 1,
-    bits_per_sample: 16,
-    sample_rate: 16000,
-    period_size: 160,
-    buffer_size: 480,
+    bits_per_sample: 32,
+    sample_rate: 48000,
+    period_size: 384,
+    buffer_size: 6144,
 });

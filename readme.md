@@ -31,7 +31,7 @@
 - 第一个 peer 接入时创建 session
 - 本地 `Event` 会广播给当前所有 peer
 - 某个 peer 发来的 `Request` 只会回给该 peer 自己
-- 每个发起 `start_recording` 的 peer 只会收到自己对应 recorder 产出的录音流
+- 每个发起录音命令（`start_recording` / `fast_recording`）的 peer 只会收到自己对应 recorder 产出的录音流
 - 最后一个 peer 退出时，session 会完整清理并回到监听 / 外连重试空闲态
 
 ## 编译与运行
@@ -351,10 +351,24 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 当前 peer 再次发起 `start_recording` 时，会先停掉旧的 `arecord`，再按新请求重新拉起
 - 当前 peer 的录音数据只会回给当前 peer
 
+`fast_recording` 行为：
+
+- 只启动当前 peer 自己的 `AudioRecorder`
+- 不需要指定业务录音配置，固定使用 `arecord -D noop -f S32_LE -r 48000 -c 8 --quiet -t raw`
+- 采集后的数据不会直接透传，而是会：
+  只保留 ch0 / ch2 / ch4 / ch6
+  将每个通道从 S32 转成 S16
+  用 SpeexDSP 以质量档位 8 把每个通道从 48k 重采样到 16k
+  将 4 个通道重新合并成 raw，并做 gzip 压缩
+- 当前 peer 再次发起 `fast_recording` 时，会先停掉旧的录音链路，再按同一套 fast profile 重新拉起
+- 如果当前 peer 之前已经通过 `start_recording` 开启了录音链路，`fast_recording` 也会先停掉旧链路，再切到 fast profile
+- 当前 peer 的录音数据只会回给当前 peer
+
 `stop_recording` 行为：
 
 - 只停止当前 peer 自己的 recorder
 - 不会影响其他 peer 的录音状态
+- 会同时关闭由 `start_recording` 或 `fast_recording` 启动的当前 peer 录音链路
 - peer 断线时也会自动停止它自己的 recorder
 
 ## monitor 生命周期
@@ -368,7 +382,7 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 
 ## 支持的远端命令
 
-当前版本实际注册并支持以下 6 个远端命令。除特别说明外，命令执行成功时返回标准 `Response(code=0, msg="success")`；命令不存在或执行失败时返回 `Response(code=-1, msg=...)`。
+当前版本实际注册并支持以下 7 个远端命令。除特别说明外，命令执行成功时返回标准 `Response(code=0, msg="success")`；命令不存在或执行失败时返回 `Response(code=-1, msg=...)`。
 
 ### `get_version`
 
@@ -401,10 +415,25 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 当前 peer 再次发起 `start_recording` 时，会先停掉旧录音链路，再按新配置重启
 - 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回该 peer 自己
 
+### `fast_recording`
+
+- 无需 `payload`
+- 启动当前 peer 自己的本地录音链路，但固定使用这套 arecord 参数：
+  `arecord -D noop -f S32_LE -r 48000 -c 8 --quiet -t raw`
+- fast 模式下，采集结果会经过以下处理后再放进 `Stream(tag="record").bytes`：
+  只保留 ch0 / ch2 / ch4 / ch6
+  每通道 S32 转 S16
+  每通道用 SpeexDSP 从 48k 重采样到 16k，质量档位 8
+  4 通道重新合并成 raw，并 gzip 压缩
+- 当前 peer 再次发起 `fast_recording` 时，会先停掉旧录音链路，再按同一套 fixed profile 重启
+- 如果当前 peer 之前已经通过 `start_recording` 开启录音，`fast_recording` 也会把旧链路关掉后再切过去
+- 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回该 peer 自己
+
 ### `stop_recording`
 
 - 无需 `payload`
 - 停止当前 peer 自己的录音链路
+- 对由 `start_recording` / `fast_recording` 开启的录音链路都生效
 
 ## 客户端主动发送的事件与流
 
@@ -437,7 +466,9 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 来源：本地 `AudioRecorder`
 - 发送范围：只发给当前启动该 recorder 的 peer，不广播给所有 peer
 - 通过 WebSocket 二进制帧发送，负载是序列化后的协议 `Stream`
-- `bytes` 字段承载实际 PCM 音频数据，`data` 当前固定为空
+- 标准录音模式下，`bytes` 承载实际 PCM 音频数据
+- `fast_recording` 模式下，`bytes` 承载的是“4 通道 S16 16k raw 数据”的 gzip 压缩结果
+- `data` 当前固定为空
 
 ## 生命周期总结
 

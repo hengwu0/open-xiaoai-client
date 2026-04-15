@@ -134,6 +134,32 @@ pub(crate) fn register_session_commands(
         }
     });
 
+    debug_log("supervisor", "Registering inbound command: fast_recording");
+    // 参数说明：
+    // - "fast_recording"：远端启动当前 peer 固定 fast profile 录音的命令名
+    // - move |context, _request| ...：按固定 fast 处理链启动当前 peer 的独立 recorder
+    registry.register("fast_recording", {
+        let peer_media = peer_media.clone();
+        let peer_hub = peer_hub.clone();
+        move |context, _request| {
+            debug_log(
+                "supervisor",
+                format!(
+                    "Executing inbound command fast_recording; peer={}",
+                    context.peer_id
+                ),
+            );
+            let media = peer_media
+                .get(context.peer_id)
+                .ok_or_else(|| anyhow::anyhow!("peer media not found: {}", context.peer_id))?;
+            let audio_sender = peer_hub.audio_sender(context.peer_id).ok_or_else(|| {
+                anyhow::anyhow!("peer audio sender not found: {}", context.peer_id)
+            })?;
+            media.recorder.start_fast_recording(audio_sender)?;
+            Ok(Response::success())
+        }
+    });
+
     debug_log("supervisor", "Registering inbound command: stop_recording");
     // 参数说明：
     // - "stop_recording"：远端停止当前 peer 本地录音的命令名
