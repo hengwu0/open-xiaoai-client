@@ -3,4 +3,5 @@ pub mod data;
 pub mod registry;
 pub mod router;
 
+// 统一导出协议层最常用的数据结构，供 transport / app / tests 直接引用。
 pub use data::{AppMessage, Event, Request, Response, Stream};

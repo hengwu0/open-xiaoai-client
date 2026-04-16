@@ -7,8 +7,11 @@ use crate::base::{AppError, debug_err_log, debug_log};
 // 这里把 stdout / stderr / exit_code 都带回去，是为了让服务端在调试设备时有足够上下文。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandResult {
+    // stdout：shell 标准输出文本
     pub stdout: String,
+    // stderr：shell 标准错误文本
     pub stderr: String,
+    // exit_code：shell 进程退出码；如果无法获得则约定为 -1
     pub exit_code: i32,
 }
 

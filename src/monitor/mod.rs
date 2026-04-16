@@ -6,4 +6,5 @@ pub mod instruction;
 pub mod kws;
 pub mod playing;
 
+// FileMonitorHandle 只在 app/fanout 等上层编排逻辑内部使用，因此保持 crate 内可见。
 pub(crate) use file::FileMonitorHandle;

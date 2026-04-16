@@ -8,9 +8,8 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 use super::commands::register_session_commands;
 use super::fanout::MonitorHandles;
-use super::peer_media::PeerMediaRegistry;
+use super::peer_context::PeerContextRegistry;
 use super::supervisor::SupervisorEvent;
-use super::ws_peer_hub::WsPeerHub;
 use crate::base::{AppError, debug_log};
 use crate::protocol::registry::CommandRegistry;
 use crate::protocol::router::{RouterThread, spawn_router};
@@ -48,8 +47,7 @@ pub(crate) struct RouterExit {
 pub(crate) struct SessionRuntime {
     pub(crate) session_id: u64,
     route_channel_writer: mpsc::SyncSender<SessionControl>,
-    peer_hub: Arc<WsPeerHub>,
-    peer_media: Arc<PeerMediaRegistry>,
+    peer_contexts: Arc<PeerContextRegistry>,
     peer_tasks: HashMap<PeerId, SessionPeer>,
     monitor_handles: MonitorHandles,
 }
@@ -59,8 +57,7 @@ impl SessionRuntime {
     //
     // 这里会一次性拉起：
     // - session 级 route_channel
-    // - WsPeerHub
-    // - per-peer 音频设备表
+    // - per-peer 完整上下文表
     // - router-thread
     // - instruction / playing / kws 三个 monitor
     //
@@ -73,29 +70,21 @@ impl SessionRuntime {
     ) -> Result<Self, AppError> {
         let (route_channel_writer, route_channel_reader) =
             mpsc::sync_channel::<SessionControl>(256);
-        let peer_hub = Arc::new(WsPeerHub::new());
-        let peer_media = Arc::new(PeerMediaRegistry::new());
+        let peer_contexts = Arc::new(PeerContextRegistry::new());
 
         let registry = Arc::new(CommandRegistry::new());
         // 参数说明：
         // - &registry：本轮 session 专属的命令注册表
-        // - peer_media.clone()：命令处理器按 peer_id 找各自独立的 player / recorder
-        // - peer_hub.clone()：命令处理器通过它拿到当前 peer 的网络音频发送句柄
-        register_session_commands(&registry, peer_media.clone(), peer_hub.clone());
+        // - peer_contexts.clone()：命令处理器按 peer_id 找当前 peer 的完整上下文
+        register_session_commands(&registry, peer_contexts.clone());
 
         // 参数说明：
         // - registry：本轮 session 的命令注册表，router 收到 Request 时通过它查 handler
         // - route_channel_reader：session 统一输入队列，收敛 monitor / ws-reader / supervisor 的消息
-        // - peer_media.clone()：收到入站播放流时按来源 peer 路由到各自独立播放器
-        // - peer_hub.clone()：router 通过它把 Response / Event / 广播消息继续分发给 peer
+        // - peer_contexts.clone()：router 通过它查 player 并继续分发出站消息
         let RouterThread {
             router_thread_handle,
-        } = spawn_router(
-            registry,
-            route_channel_reader,
-            peer_media.clone(),
-            peer_hub.clone(),
-        )?;
+        } = spawn_router(registry, route_channel_reader, peer_contexts.clone())?;
         // 参数说明：
         // - session_id：标记这个 router 属于哪一轮 session
         // - router_thread_handle：真正要等待的 router 线程句柄
@@ -115,8 +104,7 @@ impl SessionRuntime {
         Ok(Self {
             session_id,
             route_channel_writer,
-            peer_hub,
-            peer_media,
+            peer_contexts,
             peer_tasks: HashMap::new(),
             monitor_handles,
         })
@@ -126,7 +114,7 @@ impl SessionRuntime {
     //
     // 这里会完成三件事：
     // - 为该 peer 建立独立的 control/audio 队列
-    // - 把它登记到 WsPeerHub
+    // - 把它登记到 peer context 表
     // - 启动该 peer 自己的 ws-reader / ws-writer，并为它们挂退出 waiter
     //
     // 入参说明：
@@ -160,13 +148,12 @@ impl SessionRuntime {
         // - source.clone()：保留该 peer 的来源，便于后续判断是否是 outbound peer
         // - control_sender.clone()：广播/单播控制消息最终通过它发给本 peer
         // - audio_sender.clone()：当前 peer 自己的 recorder 最终通过它把录音流发回本 peer
-        self.peer_hub.add_peer(
+        self.peer_contexts.add_peer(
             peer_id,
             source.clone(),
             control_sender.clone(),
             audio_sender.clone(),
         );
-        self.peer_media.add_peer(peer_id);
 
         // 参数说明：
         // - runtime_handle：让本 peer 的 reader / writer task 跑在 supervisor 管理的 tokio runtime 上
@@ -186,6 +173,14 @@ impl SessionRuntime {
             ws_send_signal,
         ) {
             Ok(peer_tasks) => {
+                if let Err(err) = self
+                    .peer_contexts
+                    .install_ws_handle(peer_id, peer_tasks.peer_handle.clone())
+                {
+                    let _ = self.peer_contexts.remove_peer(peer_id);
+                    peer_tasks.peer_handle.close();
+                    return Err(err);
+                }
                 // 参数说明：
                 // - runtime_handle.clone()：waiter 在线程里用它等待 tokio task 结束
                 // - self.session_id：标明退出事件属于哪一轮 session
@@ -223,7 +218,6 @@ impl SessionRuntime {
                 self.peer_tasks.insert(
                     peer_id,
                     SessionPeer {
-                        source,
                         handle: peer_tasks.peer_handle,
                     },
                 );
@@ -233,14 +227,13 @@ impl SessionRuntime {
                         "Peer attached: session={}, peer={}, total_peers={}",
                         self.session_id,
                         peer_id,
-                        self.peer_hub.peer_count()
+                        self.peer_contexts.peer_count()
                     ),
                 );
                 Ok(())
             }
             Err(err) => {
-                let _ = self.peer_hub.remove_peer(peer_id);
-                let _ = self.peer_media.remove_peer(peer_id);
+                let _ = self.peer_contexts.remove_peer(peer_id);
                 Err(err)
             }
         }
@@ -250,7 +243,7 @@ impl SessionRuntime {
     //
     // 注意这里不是整轮 session 关闭，而只是：
     // - 关闭该 peer 的 reader / writer
-    // - 从 WsPeerHub 和 PeerMediaRegistry 删除它的资源
+    // - 从 peer context 表删除它的资源
     // - 停掉这个 peer 自己的 player / recorder
     //
     // 入参说明：
@@ -265,31 +258,33 @@ impl SessionRuntime {
         };
 
         // 和旧版单连接客户端一样，单 peer 收尾时先尽量给对端一个正常 close 握手机会。
-        if self.peer_hub.try_close_peer(peer_id) {
+        if self.peer_contexts.try_close_peer(peer_id) {
             std::thread::sleep(Duration::from_millis(200));
         }
-        if let Some(media) = self.peer_media.remove_peer(peer_id) {
-            let _ = media.recorder.stop_recording();
-            let _ = media.player.stop();
-        }
-        // 参数说明：
-        // - peer.handle.close()：如果优雅 close 没能让本地任务完全退出，这里做强制关闭兜底
-        peer.handle.close();
-        let Some(removal) = self.peer_hub.remove_peer(peer_id) else {
+        let Some(removed_peer) = self.peer_contexts.remove_peer(peer_id) else {
             return Ok(None);
         };
+        let _ = removed_peer.context.recorder.stop_recording();
+        let _ = removed_peer.context.player.stop();
+        // 参数说明：
+        // - peer.handle.close()：如果优雅 close 没能让本地任务完全退出，这里做强制关闭兜底
+        if let Some(handle) = removed_peer.context.ws_handle() {
+            handle.close();
+        } else {
+            peer.handle.close();
+        }
 
         debug_log(
             "supervisor",
             format!(
                 "Peer detached: session={}, peer={}, remaining_peers={}",
-                self.session_id, peer_id, removal.remaining_peers
+                self.session_id, peer_id, removed_peer.remaining_peers
             ),
         );
 
         Ok(Some(PeerDeparture {
-            source: removal.source,
-            remaining_peers: removal.remaining_peers,
+            source: removed_peer.context.source,
+            remaining_peers: removed_peer.remaining_peers,
         }))
     }
 
@@ -310,23 +305,21 @@ impl SessionRuntime {
         );
 
         // 先尽量让所有 peer 正常收到 Close，再做强制关闭兜底。
-        self.peer_hub.close_all_peers();
-        let closed_outbound_peers = self
-            .peer_tasks
-            .values()
-            .filter(|peer| matches!(peer.source, PeerSource::OutboundConnect { .. }))
-            .count();
-        for (_, peer) in self.peer_tasks.drain() {
-            peer.handle.close();
-        }
+        self.peer_contexts.close_all_peers();
+        let closed_outbound_peers = self.peer_contexts.outbound_peer_count();
+        let peers = self.peer_contexts.drain();
+        self.peer_tasks.clear();
 
         // 这里发 Close，是为了把 router 从 route_channel.recv() 的阻塞中唤醒出来。
         // 参数说明：
         // - SessionControl::Close：通知 router 主动结束当前 session 总线
         let _ = self.route_channel_writer.send(SessionControl::Close);
-        for media in self.peer_media.drain() {
-            let _ = media.recorder.stop_recording();
-            let _ = media.player.stop();
+        for peer in peers {
+            if let Some(handle) = peer.ws_handle() {
+                handle.close();
+            }
+            let _ = peer.recorder.stop_recording();
+            let _ = peer.player.stop();
         }
 
         self.monitor_handles.join();
@@ -345,9 +338,8 @@ impl SessionRuntime {
 // SessionPeer 只保存“当前 session 已挂载 peer 的最小关闭信息”。
 //
 // 真正的 reader / writer task 句柄在创建后交给 waiter 线程等待，
-// 这里保留的是统一强制关闭时需要的 WsPeerHandle。
+// 这里保留的是 attach 成功前后过渡期需要的最小关闭信息。
 struct SessionPeer {
-    source: PeerSource,
     handle: Arc<crate::transport::WsPeerHandle>,
 }
 

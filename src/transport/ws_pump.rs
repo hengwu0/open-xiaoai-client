@@ -135,7 +135,7 @@ impl WsPeerHandle {
 // 它只负责把“网络连接”准备好，不负责：
 // - 给这个 peer 分配 peer_id
 // - 启动 reader / writer 任务
-// - 把它接入当前 session 的 peer hub
+// - 把它接入当前 session 的 peer context
 //
 // 上面这些后续动作都由 supervisor 再往下推进。
 //
