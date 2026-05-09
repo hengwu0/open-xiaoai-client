@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::{LazyLock, Mutex, mpsc};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -13,8 +14,10 @@ use crate::transport::NotifyingSender;
 
 const A113_CAPTURE_BITS_PER_SAMPLE: u16 = 32;
 const FAST_RECORDING_INPUT_CHANNELS: usize = 8;
-const FAST_RECORDING_OUTPUT_CHANNELS: usize = 4;
-const FAST_RECORDING_SELECTED_CHANNELS: [usize; FAST_RECORDING_OUTPUT_CHANNELS] = [0, 2, 4, 6];
+const FAST_RECORDING_KWS_CHANNELS: usize = 3;
+const FAST_RECORDING_RAW_CHANNELS: usize = 2;
+const FAST_RECORDING_KWS_SELECTED_CHANNELS: [usize; FAST_RECORDING_KWS_CHANNELS] = [0, 2, 4];
+const FAST_RECORDING_RAW_SELECTED_CHANNELS: [usize; FAST_RECORDING_RAW_CHANNELS] = [0, 6];
 const FAST_RECORDING_INPUT_RATE: usize = 48_000;
 const FAST_RECORDING_OUTPUT_RATE: usize = 16_000;
 const FAST_RECORDING_RESAMPLE_QUALITY: usize = 8;
@@ -33,14 +36,28 @@ enum ArecordProfile {
     Fast,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastRecordingMode {
+    Kws = 0,
+    LlmRaw = 1,
+}
+
+impl FastRecordingMode {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::LlmRaw,
+            _ => Self::Kws,
+        }
+    }
+}
+
 struct FastRecordingPipeline {
-    resamplers: [SpeexResampler; FAST_RECORDING_OUTPUT_CHANNELS],
+    resamplers: [SpeexResampler; FAST_RECORDING_KWS_CHANNELS],
 }
 
 impl FastRecordingPipeline {
     fn new() -> Result<Self, AppError> {
         let mut resamplers = [
-            create_fast_resampler()?,
             create_fast_resampler()?,
             create_fast_resampler()?,
             create_fast_resampler()?,
@@ -52,16 +69,25 @@ impl FastRecordingPipeline {
         Ok(Self { resamplers })
     }
 
-    fn process_chunk(&mut self, chunk: &[u8]) -> Result<Vec<u8>, AppError> {
-        let extracted_channels = extract_fast_channels_as_s16(chunk)?;
-        let mut resampled_channels = Vec::with_capacity(FAST_RECORDING_OUTPUT_CHANNELS);
-        for (index, samples) in extracted_channels.into_iter().enumerate() {
-            resampled_channels.push(resample_fast_channel(
-                &mut self.resamplers[index],
-                &samples,
-            )?);
+    fn process_chunk(
+        &mut self,
+        chunk: &[u8],
+        mode: FastRecordingMode,
+    ) -> Result<Vec<u8>, AppError> {
+        match mode {
+            FastRecordingMode::Kws => {
+                let extracted_channels = extract_fast_channels_as_s16(chunk)?;
+                let mut resampled_channels = Vec::with_capacity(FAST_RECORDING_KWS_CHANNELS);
+                for (index, samples) in extracted_channels.into_iter().enumerate() {
+                    resampled_channels.push(resample_fast_channel(
+                        &mut self.resamplers[index],
+                        &samples,
+                    )?);
+                }
+                Ok(interleave_s16_channels(&resampled_channels))
+            }
+            FastRecordingMode::LlmRaw => extract_fast_raw_channels_s32(chunk),
         }
-        Ok(interleave_s16_channels(&resampled_channels))
     }
 }
 
@@ -78,6 +104,7 @@ impl FastRecordingPipeline {
 pub struct AudioRecorder {
     child: Mutex<Option<Child>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    fast_mode: Arc<AtomicU8>,
 }
 
 impl AudioRecorder {
@@ -90,6 +117,7 @@ impl AudioRecorder {
         Self {
             child: Mutex::new(None),
             task: Mutex::new(None),
+            fast_mode: Arc::new(AtomicU8::new(FastRecordingMode::Kws as u8)),
         }
     }
 
@@ -127,11 +155,31 @@ impl AudioRecorder {
         &self,
         audio_output: NotifyingSender<Vec<u8>>,
     ) -> Result<(), AppError> {
+        self.fast_mode
+            .store(FastRecordingMode::Kws as u8, Ordering::SeqCst);
         self.start_recording_with_profile(
             (*FAST_RECORDING_CONFIG).clone(),
             ArecordProfile::Fast,
             audio_output,
         )
+    }
+
+    // switch_to_llm_start_audio 将 fast_recording 从 KWS 三通道输出切到 LLM 会话 raw 双通道输出。
+    //
+    // 入参说明：
+    // - self：当前 peer 自己的录音器实例
+    pub fn switch_to_llm_start_audio(&self) {
+        self.fast_mode
+            .store(FastRecordingMode::LlmRaw as u8, Ordering::SeqCst);
+    }
+
+    // switch_to_llm_stop_audio 将 fast_recording 切回唤醒前 KWS 三通道输出。
+    //
+    // 入参说明：
+    // - self：当前 peer 自己的录音器实例
+    pub fn switch_to_llm_stop_audio(&self) {
+        self.fast_mode
+            .store(FastRecordingMode::Kws as u8, Ordering::SeqCst);
     }
 
     fn start_recording_with_profile(
@@ -151,6 +199,7 @@ impl AudioRecorder {
             ArecordProfile::Standard => None,
             ArecordProfile::Fast => Some(FastRecordingPipeline::new()?),
         };
+        let fast_mode = self.fast_mode.clone();
         debug_log(
             "audio-recorder",
             format!(
@@ -214,22 +263,25 @@ impl AudioRecorder {
                                 ArecordProfile::Standard => {
                                     transform_stream_chunk(chunk, &requested, &capture)
                                 }
-                                ArecordProfile::Fast => match fast_pipeline
-                                    .as_mut()
-                                    .expect("fast pipeline must exist for fast profile")
-                                    .process_chunk(&chunk)
-                                {
-                                    Ok(bytes) => bytes,
-                                    Err(err) => {
-                                        debug_err_log(
-                                            "audio-recorder",
-                                            format!(
-                                                "Failed to process fast recording chunk: {err}"
-                                            ),
-                                        );
-                                        break;
+                                ArecordProfile::Fast => {
+                                    let mode = FastRecordingMode::from_u8(fast_mode.load(Ordering::SeqCst));
+                                    match fast_pipeline
+                                        .as_mut()
+                                        .expect("fast pipeline must exist for fast profile")
+                                        .process_chunk(&chunk, mode)
+                                    {
+                                        Ok(bytes) => bytes,
+                                        Err(err) => {
+                                            debug_err_log(
+                                                "audio-recorder",
+                                                format!(
+                                                    "Failed to process fast recording chunk: {err}"
+                                                ),
+                                            );
+                                            break;
+                                        }
                                     }
-                                },
+                                }
                             };
                             if !bytes.is_empty() {
                                 debug_log_limited(
@@ -348,7 +400,7 @@ fn create_fast_resampler() -> Result<SpeexResampler, AppError> {
 
 fn extract_fast_channels_as_s16(
     chunk: &[u8],
-) -> Result<[Vec<i16>; FAST_RECORDING_OUTPUT_CHANNELS], AppError> {
+) -> Result<[Vec<i16>; FAST_RECORDING_KWS_CHANNELS], AppError> {
     let bytes_per_sample = std::mem::size_of::<i32>();
     let input_frame_size = FAST_RECORDING_INPUT_CHANNELS * bytes_per_sample;
     if !chunk.len().is_multiple_of(input_frame_size) {
@@ -362,8 +414,10 @@ fn extract_fast_channels_as_s16(
     let frame_count = chunk.len() / input_frame_size;
     let mut channels = std::array::from_fn(|_| Vec::with_capacity(frame_count));
     for frame in chunk.chunks_exact(input_frame_size) {
-        for (output_channel_index, input_channel_index) in
-            FAST_RECORDING_SELECTED_CHANNELS.iter().copied().enumerate()
+        for (output_channel_index, input_channel_index) in FAST_RECORDING_KWS_SELECTED_CHANNELS
+            .iter()
+            .copied()
+            .enumerate()
         {
             let base = input_channel_index * bytes_per_sample;
             let sample = i32::from_le_bytes([
@@ -376,6 +430,28 @@ fn extract_fast_channels_as_s16(
         }
     }
     Ok(channels)
+}
+
+fn extract_fast_raw_channels_s32(chunk: &[u8]) -> Result<Vec<u8>, AppError> {
+    let bytes_per_sample = std::mem::size_of::<i32>();
+    let input_frame_size = FAST_RECORDING_INPUT_CHANNELS * bytes_per_sample;
+    if !chunk.len().is_multiple_of(input_frame_size) {
+        return Err(anyhow::anyhow!(
+            "fast recording raw chunk size {} is not aligned to {}-channel S32 frames",
+            chunk.len(),
+            FAST_RECORDING_INPUT_CHANNELS
+        ));
+    }
+
+    let frame_count = chunk.len() / input_frame_size;
+    let mut out = Vec::with_capacity(frame_count * FAST_RECORDING_RAW_CHANNELS * bytes_per_sample);
+    for frame in chunk.chunks_exact(input_frame_size) {
+        for input_channel_index in FAST_RECORDING_RAW_SELECTED_CHANNELS {
+            let base = input_channel_index * bytes_per_sample;
+            out.extend_from_slice(&frame[base..base + bytes_per_sample]);
+        }
+    }
+    Ok(out)
 }
 
 fn resample_fast_channel(
@@ -535,11 +611,12 @@ fn build_arecord_args(config: &AudioConfig, profile: ArecordProfile) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        ArecordProfile, FAST_RECORDING_CONFIG, FAST_RECORDING_INPUT_CHANNELS,
-        FAST_RECORDING_OUTPUT_CHANNELS, FastRecordingPipeline, build_arecord_args,
-        extract_fast_channels_as_s16,
+        ArecordProfile, AudioRecorder, FAST_RECORDING_CONFIG, FAST_RECORDING_INPUT_CHANNELS,
+        FAST_RECORDING_KWS_CHANNELS, FastRecordingMode, FastRecordingPipeline, build_arecord_args,
+        extract_fast_channels_as_s16, extract_fast_raw_channels_s32,
     };
     use crate::audio::AudioConfig;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn standard_arecord_args_include_buffer_and_period_sizes() {
@@ -591,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_channel_extraction_keeps_even_channels_and_converts_to_s16() {
+    fn fast_channel_extraction_keeps_kws_channels_and_converts_to_s16() {
         let samples = [
             [1_i32, 2, 3, 4, 5, 6, 7, 8],
             [11_i32, 12, 13, 14, 15, 16, 17, 18],
@@ -608,11 +685,36 @@ mod tests {
         assert_eq!(extracted[0], vec![1, 11]);
         assert_eq!(extracted[1], vec![3, 13]);
         assert_eq!(extracted[2], vec![5, 15]);
-        assert_eq!(extracted[3], vec![7, 17]);
     }
 
     #[test]
-    fn fast_pipeline_outputs_raw_pcm_payload() {
+    fn fast_raw_extraction_keeps_ch0_and_ch6_as_s32_without_shift() {
+        let samples = [
+            [0x0001_0203_i32, 2, 3, 4, 5, 6, 0x0007_0809, 8],
+            [0x0011_1213_i32, 12, 13, 14, 15, 16, 0x0017_1819, 18],
+        ];
+        let mut chunk = Vec::new();
+        for frame in samples {
+            for sample in frame {
+                chunk.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+
+        let raw = extract_fast_raw_channels_s32(&chunk).unwrap();
+
+        let expected = [0x0001_0203_i32, 0x0007_0809, 0x0011_1213, 0x0017_1819];
+        let actual = raw
+            .chunks_exact(std::mem::size_of::<i32>())
+            .map(|bytes| {
+                let sample: [u8; 4] = bytes.try_into().unwrap();
+                i32::from_le_bytes(sample)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fast_pipeline_outputs_three_channel_kws_pcm_before_llm_start() {
         let frames = FAST_RECORDING_CONFIG.buffer_size as usize;
         let mut chunk =
             Vec::with_capacity(frames * FAST_RECORDING_INPUT_CHANNELS * std::mem::size_of::<i32>());
@@ -621,10 +723,57 @@ mod tests {
         }
 
         let mut pipeline = FastRecordingPipeline::new().unwrap();
-        let pcm = pipeline.process_chunk(&chunk).unwrap();
+        let pcm = pipeline
+            .process_chunk(&chunk, FastRecordingMode::Kws)
+            .unwrap();
 
         assert!(!pcm.is_empty());
-        assert!(pcm.len().is_multiple_of(FAST_RECORDING_OUTPUT_CHANNELS * 2));
+        assert!(pcm.len().is_multiple_of(FAST_RECORDING_KWS_CHANNELS * 2));
         assert!(pcm.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn fast_pipeline_outputs_raw_two_channel_s32_after_llm_start() {
+        let frames = 2usize;
+        let mut chunk =
+            Vec::with_capacity(frames * FAST_RECORDING_INPUT_CHANNELS * std::mem::size_of::<i32>());
+        for frame in 0..frames {
+            for channel in 0..FAST_RECORDING_INPUT_CHANNELS {
+                let sample = (frame as i32) * 100 + channel as i32;
+                chunk.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+
+        let mut pipeline = FastRecordingPipeline::new().unwrap();
+        let pcm = pipeline
+            .process_chunk(&chunk, FastRecordingMode::LlmRaw)
+            .unwrap();
+
+        let actual = pcm
+            .chunks_exact(std::mem::size_of::<i32>())
+            .map(|bytes| {
+                let sample: [u8; 4] = bytes.try_into().unwrap();
+                i32::from_le_bytes(sample)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![0, 6, 100, 106]);
+    }
+
+    #[test]
+    fn fast_mode_returns_to_kws_after_llm_stop() {
+        // 验证 llm_start 后切 raw 双通道，llm_stop 后必须回到三通道 KWS 模式。
+        let recorder = AudioRecorder::new();
+
+        recorder.switch_to_llm_start_audio();
+        assert_eq!(
+            FastRecordingMode::from_u8(recorder.fast_mode.load(Ordering::SeqCst)),
+            FastRecordingMode::LlmRaw
+        );
+
+        recorder.switch_to_llm_stop_audio();
+        assert_eq!(
+            FastRecordingMode::from_u8(recorder.fast_mode.load(Ordering::SeqCst)),
+            FastRecordingMode::Kws
+        );
     }
 }

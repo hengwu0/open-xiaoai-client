@@ -357,11 +357,13 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 
 - 只启动当前 peer 自己的 `AudioRecorder`
 - 不需要指定业务录音配置，固定使用 `arecord -D noop -f S32_LE -r 48000 -c 8 --quiet -t raw`
-- 采集后的数据不会直接透传，而是会：
-  只保留 ch0 / ch2 / ch4 / ch6
+- 唤醒前采集后的数据不会直接透传，而是会：
+  只保留 ch0 / ch2 / ch4
   将每个通道按 normal 路径一致的算法从 S32 转成 S16
   用 SpeexDSP 以质量档位 8 把每个通道从 48k 重采样到 16k
-  将 4 个通道重新合并成 raw，并直接发送原始音频数据
+  将 3 个通道重新合并成 raw，并直接发送原始音频数据
+- 当前 peer 收到 `llm_start` 后，会先清空该 peer 的待发音频队列并回复 `msg="llm_start_ok"`，之后改发 ch0 / ch6 原始双通道 `S32_LE / 48kHz` PCM；这两个通道会重新编号成 ch0 / ch1，不做 S16 转换，也不做 16k 重采样
+- 当前 peer 收到 `llm_stop` 后，会先把 fast recorder 切回 ch0 / ch2 / ch4 三通道 KWS 模式，清空尚未写入 WebSocket 的旧 raw 音频帧，再回复 `msg="llm_stop_ok"`
 - 当前 peer 再次发起 `fast_recording` 时，会先停掉旧的录音链路，再按同一套 fast profile 重新拉起
 - 如果当前 peer 之前已经通过 `start_recording` 开启了录音链路，`fast_recording` 也会先停掉旧链路，再切到 fast profile
 - 当前 peer 的录音数据只会回给当前 peer
@@ -422,14 +424,28 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 无需 `payload`
 - 启动当前 peer 自己的本地录音链路，但固定使用这套 arecord 参数：
   `arecord -D noop -f S32_LE -r 48000 -c 8 --quiet -t raw`
-- fast 模式下，采集结果会经过以下处理后再放进 `Stream(tag="record").bytes`：
-  只保留 ch0 / ch2 / ch4 / ch6
+- fast 模式唤醒前，采集结果会经过以下处理后再放进 `Stream(tag="record").bytes`：
+  只保留 ch0 / ch2 / ch4
   每通道按 normal 路径一致的算法做 S32 转 S16
   每通道用 SpeexDSP 从 48k 重采样到 16k，质量档位 8
-  4 通道重新合并成 raw，并直接发送原始音频数据
+  3 通道重新合并成 raw，并直接发送原始音频数据
 - 当前 peer 再次发起 `fast_recording` 时，会先停掉旧录音链路，再按同一套 fixed profile 重启
 - 如果当前 peer 之前已经通过 `start_recording` 开启录音，`fast_recording` 也会把旧链路关掉后再切过去
 - 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回该 peer 自己
+
+### `llm_start`
+
+- 无需 `payload`
+- 只影响当前 peer 自己的 fast recorder 和待发音频队列
+- 收到后会先把该 peer 还没写入 WebSocket 的录音帧清空，再把 fast recorder 切到 ch0 / ch6 原始双通道模式
+- 成功后返回 `msg="llm_start_ok"`；后续 `Stream(tag="record").bytes` 承载 ch0 / ch6 重新编号后的 ch0 / ch1 `S32_LE / 48kHz` raw PCM，不做 S16 转换，也不做重采样
+
+### `llm_stop`
+
+- 无需 `payload`
+- 只影响当前 peer 自己的 fast recorder 和待发音频队列
+- 收到后会先把 fast recorder 切回 ch0 / ch2 / ch4 三通道 KWS 模式，再清空该 peer 尚未写入 WebSocket 的旧 raw 录音帧
+- 成功后返回 `msg="llm_stop_ok"`；后续 `Stream(tag="record").bytes` 重新承载三通道 S16 / 16k raw PCM，供服务端 KWS 等待下一次唤醒
 
 ### `stop_recording`
 
@@ -469,7 +485,7 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 发送范围：只发给当前启动该 recorder 的 peer，不广播给所有 peer
 - 通过 WebSocket 二进制帧发送，负载是序列化后的协议 `Stream`
 - 标准录音模式下，`bytes` 承载实际 PCM 音频数据
-- `fast_recording` 模式下，`bytes` 承载的是“4 通道 S16 16k raw 数据”的原始字节
+- `fast_recording` 唤醒前，`bytes` 承载的是“三通道 S16 16k raw 数据”的原始字节；`llm_start_ok` 后，`bytes` 承载的是“ch0/ch6 重新编号后的双通道 S32_LE 48k raw 数据”的原始字节；`llm_stop_ok` 后回到三通道 S16 / 16k raw 数据
 - `data` 当前固定为空
 
 ## 生命周期总结

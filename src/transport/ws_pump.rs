@@ -515,6 +515,27 @@ fn spawn_ws_writer(
                     match control_ws_reader.try_recv() {
                         Ok(control) => {
                             progressed = true;
+                            if let OutboundControl::ClearAudioQueue(ack) = control {
+                                let mut cleared = 0usize;
+                                loop {
+                                    match audio_ws_reader.try_recv() {
+                                        Ok(_bytes) => {
+                                            cleared += 1;
+                                        }
+                                        Err(mpsc::TryRecvError::Empty) => break,
+                                        Err(mpsc::TryRecvError::Disconnected) => {
+                                            audio_queue_closed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                let _ = ack.send(cleared);
+                                debug_log(
+                                    "ws",
+                                    format!("Cleared outbound audio queue: {cleared} frame(s)"),
+                                );
+                                continue;
+                            }
                             // control 通道优先级更高，确保 response / close 这类小消息
                             // 不会被持续音频流长时间压住。
                             let is_close_frame = matches!(control, OutboundControl::Close);

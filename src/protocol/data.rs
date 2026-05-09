@@ -114,6 +114,15 @@ impl Response {
         }
     }
 
+    pub fn success_msg(msg: &str) -> Self {
+        Self {
+            id: "0".to_string(),
+            code: Some(0),
+            msg: Some(msg.to_string()),
+            data: None,
+        }
+    }
+
     // from_data 构造一条“只返回 data、不显式设置 code/msg”的响应。
     //
     // 它常用于查询类命令：调用方更关心返回内容本身，而不是统一成功文案。

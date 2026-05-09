@@ -67,6 +67,8 @@ pub enum OutboundControl {
     // 二进制消息承载 Stream，例如录音流 `tag=record`。
     // 这里的 Vec<u8> 也应当是已经按协议编码好的负载。
     Binary(Vec<u8>),
+    // 清空当前 peer 尚未发出的音频队列，并通过 ack 返回丢弃条数。
+    ClearAudioQueue(mpsc::SyncSender<usize>),
     // 主动尝试走一次 websocket close 握手。
     // 这类消息只应该出现在 session 收尾阶段。
     Close,

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use crate::audio::{AudioPlayer, AudioRecorder};
 use crate::base::{AppError, debug_err_log, debug_log};
@@ -60,6 +61,16 @@ impl PeerContext {
     // - self：当前 peer 的完整上下文
     pub(crate) fn audio_sender(&self) -> NotifyingSender<Vec<u8>> {
         self.audio_sender.clone()
+    }
+
+    pub(crate) fn clear_audio_queue(&self) -> Result<usize, AppError> {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.control_sender
+            .send(OutboundControl::ClearAudioQueue(ack_tx))
+            .map_err(|err| anyhow::anyhow!("failed to queue audio clear command: {err}"))?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|err| anyhow::anyhow!("timed out waiting for audio queue clear: {err}"))
     }
 
     // 返回当前 peer 的 websocket 强制关闭句柄。

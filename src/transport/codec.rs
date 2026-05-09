@@ -138,6 +138,9 @@ pub fn encode_outbound(outbound: OutboundControl) -> Message {
             );
             Message::Binary(bytes.into())
         }
+        OutboundControl::ClearAudioQueue(_) => {
+            unreachable!("ClearAudioQueue is consumed by ws-writer before codec encoding")
+        }
         OutboundControl::Close => {
             debug_log("codec", "Encoding outbound close frame");
             Message::Close(None)
