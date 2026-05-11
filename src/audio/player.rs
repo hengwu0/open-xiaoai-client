@@ -52,7 +52,12 @@ impl AudioPlayer {
     // - self：当前 peer 自己的播放器实例
     // - config：可选播放配置；为空时退回全局默认 AUDIO_CONFIG
     pub fn start(&self, config: Option<AudioConfig>) -> Result<(), AppError> {
-        // 每次重新 start 都先做一次完整 stop，避免遗留旧的 aplay 进程和写线程。
+        // start_play 必须幂等：播放链路已启动时直接成功，禁止重复 reopen aplay。
+        if self.sender.lock().expect("player sender poisoned").is_some() {
+            debug_log("audio-player", "Player already started; duplicate start ignored");
+            return Ok(());
+        }
+        // 未启动时才真正拉起播放器；不同配置热切换应先由 stop_play 明确关闭旧链路。
         self.stop()?;
         // 服务端可以选择显式传入 AudioConfig，也可以直接复用默认配置。
         let config = config.unwrap_or_else(|| (*AUDIO_CONFIG).clone());

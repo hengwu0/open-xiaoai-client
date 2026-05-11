@@ -104,6 +104,7 @@ impl FastRecordingPipeline {
 pub struct AudioRecorder {
     child: Mutex<Option<Child>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    profile: Mutex<Option<ArecordProfile>>,
     fast_mode: Arc<AtomicU8>,
 }
 
@@ -117,6 +118,7 @@ impl AudioRecorder {
         Self {
             child: Mutex::new(None),
             task: Mutex::new(None),
+            profile: Mutex::new(None),
             fast_mode: Arc::new(AtomicU8::new(FastRecordingMode::Kws as u8)),
         }
     }
@@ -155,8 +157,6 @@ impl AudioRecorder {
         &self,
         audio_output: NotifyingSender<Vec<u8>>,
     ) -> Result<(), AppError> {
-        self.fast_mode
-            .store(FastRecordingMode::Kws as u8, Ordering::SeqCst);
         self.start_recording_with_profile(
             (*FAST_RECORDING_CONFIG).clone(),
             ArecordProfile::Fast,
@@ -188,8 +188,30 @@ impl AudioRecorder {
         profile: ArecordProfile,
         audio_output: NotifyingSender<Vec<u8>>,
     ) -> Result<(), AppError> {
-        // 和播放器保持一致：重复 start_recording 时，先停旧链路，再按新配置重启。
+        // start/stop 必须幂等：同一 profile 已经在跑时直接成功，禁止重复 reopen ALSA。
+        {
+            let profile_guard = self.profile.lock().expect("recorder profile poisoned");
+            // 判断是否需要真正打开录音设备。
+            // - *profile_guard：当前已经运行的录音 profile
+            // - profile：本次请求的录音 profile
+            if *profile_guard == Some(profile) {
+                debug_log(
+                    "audio-recorder",
+                    format!(
+                        "Recorder already running for profile {:?}; duplicate start ignored",
+                        profile
+                    ),
+                );
+                return Ok(());
+            }
+        }
+
+        // 不同 profile 的 start 仍然先停旧链路，再按新配置启动。
         self.stop_recording()?;
+        if matches!(profile, ArecordProfile::Fast) {
+            self.fast_mode
+                .store(FastRecordingMode::Kws as u8, Ordering::SeqCst);
+        }
         // 标准录音仍然保留设备兼容转换；fast profile 则直接按固定参数采集。
         let capture = match profile {
             ArecordProfile::Standard => capture_config_for_recording(&requested),
@@ -326,6 +348,7 @@ impl AudioRecorder {
         })?;
         *self.child.lock().expect("recorder child poisoned") = Some(child);
         *self.task.lock().expect("recorder task poisoned") = Some(handle);
+        *self.profile.lock().expect("recorder profile poisoned") = Some(profile);
         Ok(())
     }
 
@@ -346,6 +369,7 @@ impl AudioRecorder {
         if let Some(handle) = self.task.lock().expect("recorder task poisoned").take() {
             let _ = handle.join();
         }
+        *self.profile.lock().expect("recorder profile poisoned") = None;
         debug_log("audio-recorder", "Recorder stopped");
         Ok(())
     }
