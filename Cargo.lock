@@ -88,7 +88,6 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "speexdsp-resampler",
  "tokio",
  "tokio-tungstenite",
  "uuid",
@@ -562,12 +561,6 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
-
-[[package]]
-name = "speexdsp-resampler"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b72d540d5c565dbe1f891d7e21ceb21d2649508306782f1066989fccb0b363d3"
 
 [[package]]
 name = "syn"

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use super::peer_context::PeerContextRegistry;
-use crate::base::{VERSION, debug_log};
-use crate::protocol::Response;
+use crate::base::{debug_log, VERSION};
 use crate::protocol::registry::CommandRegistry;
+use crate::protocol::Response;
 use crate::shell::command::run_shell;
 
 // 注册一轮 session 可用的远端命令。
@@ -167,8 +167,8 @@ pub(crate) fn register_session_commands(
 
     debug_log("supervisor", "Registering inbound command: llm_start");
     // 参数说明：
-    // - "llm_start"：服务端本地 KWS 命中后，请求当前 peer 切到 LLM 会话 raw 双通道录音模式
-    // - move |context, _request| ...：先切 recorder 模式，再清空旧三通道音频队列并返回确认
+    // - "llm_start"：服务端本地 KWS 命中后，请求当前 peer 切到 LLM 会话双通道录音模式
+    // - move |context, _request| ...：先切 recorder 模式，再清空旧单通道音频队列并返回确认
     registry.register("llm_start", {
         let peer_contexts = peer_contexts.clone();
         move |context, _request| {
@@ -182,11 +182,12 @@ pub(crate) fn register_session_commands(
             let peer = peer_contexts
                 .get(context.peer_id)
                 .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
-            peer.recorder.switch_to_llm_start_audio();
+            peer.recorder
+                .switch_to_llm_start_audio(peer.audio_sender())?;
             let cleared = peer.clear_audio_queue()?;
             debug_log(
                 "supervisor",
-                format!("llm_start prepared raw recording mode; cleared_audio_frames={cleared}"),
+                format!("llm_start prepared 2ch recording mode; cleared_audio_frames={cleared}"),
             );
             Ok(Response::success_msg("llm_start_ok"))
         }
@@ -194,8 +195,8 @@ pub(crate) fn register_session_commands(
 
     debug_log("supervisor", "Registering inbound command: llm_stop");
     // 参数说明：
-    // - "llm_stop"：服务端一轮 LLM 会话结束后，请求当前 peer 回到 KWS 三通道录音模式
-    // - move |context, _request| ...：先切 recorder 模式，再清空旧 raw 双通道音频队列并返回确认
+    // - "llm_stop"：服务端一轮 LLM 会话结束后，请求当前 peer 回到 KWS 单通道录音模式
+    // - move |context, _request| ...：先切 recorder 模式，再清空旧双通道音频队列并返回确认
     registry.register("llm_stop", {
         let peer_contexts = peer_contexts.clone();
         move |context, _request| {
@@ -209,11 +210,12 @@ pub(crate) fn register_session_commands(
             let peer = peer_contexts
                 .get(context.peer_id)
                 .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
-            peer.recorder.switch_to_llm_stop_audio();
+            peer.recorder
+                .switch_to_llm_stop_audio(peer.audio_sender())?;
             let cleared = peer.clear_audio_queue()?;
             debug_log(
                 "supervisor",
-                format!("llm_stop restored KWS recording mode; cleared_audio_frames={cleared}"),
+                format!("llm_stop restored 1ch KWS recording mode; cleared_audio_frames={cleared}"),
             );
             Ok(Response::success_msg("llm_stop_ok"))
         }
