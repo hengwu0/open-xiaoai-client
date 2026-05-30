@@ -10,6 +10,7 @@ use crate::config::RunConfig;
 use crate::shell::device::get_device_listen_code;
 use crate::transport::{PeerId, PeerSource, PendingPeer};
 
+use super::capabilities::AppCapabilities;
 use super::session::{PeerTaskExit, RouterExit, SessionRuntime};
 
 // SupervisorEvent 是 AppSupervisor 主循环消费的统一事件入口。
@@ -41,6 +42,7 @@ pub struct AppSupervisor {
     ws_runtime: Runtime,
     next_session_id: u64,
     next_peer_id: PeerId,
+    capabilities: AppCapabilities,
 }
 
 impl AppSupervisor {
@@ -66,6 +68,7 @@ impl AppSupervisor {
             ws_runtime,
             next_session_id: 1,
             next_peer_id: 1,
+            capabilities: AppCapabilities::default(),
         }
     }
 
@@ -89,6 +92,12 @@ impl AppSupervisor {
                 self.run_config.listen_enabled,
                 self.run_config.server_url
             ),
+        );
+
+        self.capabilities = AppCapabilities::detect_at_startup();
+        debug_log(
+            "supervisor",
+            format!("Effective startup capabilities: {:?}", self.capabilities),
         );
 
         // ws_connect_event_writer / ws_connect_event_reader 是 supervisor 的“总线”：
@@ -251,7 +260,11 @@ impl AppSupervisor {
         // 参数说明：
         // - session_id：本地递增的 session 标签，用于日志和退出事件关联
         // - ws_connect_event_writer：交给 session 内部，用于上报 peer/router 退出事件
-        SessionRuntime::new(session_id, ws_connect_event_writer)
+        SessionRuntime::new(
+            session_id,
+            ws_connect_event_writer,
+            self.capabilities.clone(),
+        )
     }
 
     // 分配下一轮 session 的本地编号。

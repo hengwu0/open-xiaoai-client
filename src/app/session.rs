@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
 
+use super::capabilities::AppCapabilities;
 use super::commands::register_session_commands;
 use super::fanout::MonitorHandles;
 use super::peer_context::PeerContextRegistry;
@@ -64,9 +65,11 @@ impl SessionRuntime {
     // 入参说明：
     // - session_id：当前新 session 的本地编号
     // - ws_connect_event_writer：session 内部各 waiter 用它把退出事件回传给 supervisor
+    // - capabilities：进程启动阶段探测到的本机能力，向本轮命令注册表透传
     pub(crate) fn new(
         session_id: u64,
         ws_connect_event_writer: mpsc::Sender<SupervisorEvent>,
+        capabilities: AppCapabilities,
     ) -> Result<Self, AppError> {
         let (route_channel_writer, route_channel_reader) =
             mpsc::sync_channel::<SessionControl>(256);
@@ -76,7 +79,7 @@ impl SessionRuntime {
         // 参数说明：
         // - &registry：本轮 session 专属的命令注册表
         // - peer_contexts.clone()：命令处理器按 peer_id 找当前 peer 的完整上下文
-        register_session_commands(&registry, peer_contexts.clone());
+        register_session_commands(&registry, peer_contexts.clone(), capabilities.clone());
 
         // 参数说明：
         // - registry：本轮 session 的命令注册表，router 收到 Request 时通过它查 handler
@@ -98,7 +101,9 @@ impl SessionRuntime {
 
         debug_log(
             "supervisor",
-            format!("Session resources created for session {session_id}"),
+            format!(
+                "Session resources created for session {session_id}; capabilities={capabilities:?}"
+            ),
         );
 
         Ok(Self {

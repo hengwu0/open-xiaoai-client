@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::capabilities::AppCapabilities;
 use super::peer_context::PeerContextRegistry;
 use crate::base::{debug_log, VERSION};
 use crate::protocol::registry::CommandRegistry;
@@ -16,9 +17,11 @@ use crate::shell::command::run_shell;
 // 入参说明：
 // - registry：当前 session 专属的命令注册表
 // - peer_contexts：当前 session 的 per-peer 完整上下文表
+// - capabilities：进程启动阶段探测到的本机能力，用于决定是否注册 fast_recording 相关命令
 pub(crate) fn register_session_commands(
     registry: &Arc<CommandRegistry>,
     peer_contexts: Arc<PeerContextRegistry>,
+    capabilities: AppCapabilities,
 ) {
     // 这张表定义的是“远端能驱动本机做什么”。
     // 约束保持不变：
@@ -158,86 +161,93 @@ pub(crate) fn register_session_commands(
         }
     });
 
-    debug_log("supervisor", "Registering inbound command: fast_recording");
-    // 参数说明：
-    // - "fast_recording"：远端启动当前 peer 固定 fast profile 录音的命令名
-    // - move |context, _request| ...：按固定 fast 处理链启动当前 peer 的独立 recorder
-    registry.register("fast_recording", {
-        let peer_contexts = peer_contexts.clone();
-        move |context, _request| {
-            debug_log(
-                "supervisor",
-                format!(
-                    "Executing inbound command fast_recording; peer={}",
-                    context.peer_id
-                ),
-            );
-            // 参数说明：
-            // - context.peer_id：当前命令来源 peer
-            // - peer.audio_sender()：当前 peer 的录音流回传出口
-            let peer = peer_contexts
-                .get(context.peer_id)
-                .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
-            peer.recorder.start_fast_recording(peer.audio_sender())?;
-            Ok(Response::success())
-        }
-    });
+    if capabilities.fast_recording_enabled {
+        debug_log("supervisor", "Registering inbound command: fast_recording");
+        // 参数说明：
+        // - "fast_recording"：远端启动当前 peer 固定 fast profile 录音的命令名
+        // - move |context, _request| ...：按固定 fast 处理链启动当前 peer 的独立 recorder
+        registry.register("fast_recording", {
+            let peer_contexts = peer_contexts.clone();
+            move |context, _request| {
+                debug_log(
+                    "supervisor",
+                    format!(
+                        "Executing inbound command fast_recording; peer={}",
+                        context.peer_id
+                    ),
+                );
+                // 参数说明：
+                // - context.peer_id：当前命令来源 peer
+                // - peer.audio_sender()：当前 peer 的录音流回传出口
+                let peer = peer_contexts
+                    .get(context.peer_id)
+                    .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
+                peer.recorder.start_fast_recording(peer.audio_sender())?;
+                Ok(Response::success())
+            }
+        });
 
-    debug_log("supervisor", "Registering inbound command: llm_start");
-    // 参数说明：
-    // - "llm_start"：服务端本地 KWS 命中后，请求当前 peer 切到 LLM 会话双通道录音模式
-    // - move |context, _request| ...：先切 recorder 模式，再清空旧单通道音频队列并返回确认
-    registry.register("llm_start", {
-        let peer_contexts = peer_contexts.clone();
-        move |context, _request| {
-            debug_log(
-                "supervisor",
-                format!(
-                    "Executing inbound command llm_start; peer={}",
-                    context.peer_id
-                ),
-            );
-            let peer = peer_contexts
-                .get(context.peer_id)
-                .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
-            peer.recorder
-                .switch_to_llm_start_audio(peer.audio_sender())?;
-            let cleared = peer.clear_audio_queue()?;
-            debug_log(
-                "supervisor",
-                format!("llm_start prepared 2ch recording mode; cleared_audio_frames={cleared}"),
-            );
-            Ok(Response::success_msg("llm_start_ok"))
-        }
-    });
+        debug_log("supervisor", "Registering inbound command: llm_start");
+        // 参数说明：
+        // - "llm_start"：服务端本地 KWS 命中后，请求当前 peer 切到 LLM 会话双通道录音模式
+        // - move |context, _request| ...：先切 recorder 模式，再清空旧单通道音频队列并返回确认
+        registry.register("llm_start", {
+            let peer_contexts = peer_contexts.clone();
+            move |context, _request| {
+                debug_log(
+                    "supervisor",
+                    format!(
+                        "Executing inbound command llm_start; peer={}",
+                        context.peer_id
+                    ),
+                );
+                let peer = peer_contexts
+                    .get(context.peer_id)
+                    .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
+                peer.recorder
+                    .switch_to_llm_start_audio(peer.audio_sender())?;
+                let cleared = peer.clear_audio_queue()?;
+                debug_log(
+                    "supervisor",
+                    format!("llm_start prepared 2ch recording mode; cleared_audio_frames={cleared}"),
+                );
+                Ok(Response::success_msg("llm_start_ok"))
+            }
+        });
 
-    debug_log("supervisor", "Registering inbound command: llm_stop");
-    // 参数说明：
-    // - "llm_stop"：服务端一轮 LLM 会话结束后，请求当前 peer 回到 KWS 单通道录音模式
-    // - move |context, _request| ...：先切 recorder 模式，再清空旧双通道音频队列并返回确认
-    registry.register("llm_stop", {
-        let peer_contexts = peer_contexts.clone();
-        move |context, _request| {
-            debug_log(
-                "supervisor",
-                format!(
-                    "Executing inbound command llm_stop; peer={}",
-                    context.peer_id
-                ),
-            );
-            let peer = peer_contexts
-                .get(context.peer_id)
-                .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
-            peer.recorder
-                .switch_to_llm_stop_audio(peer.audio_sender())?;
-            let cleared = peer.clear_audio_queue()?;
-            debug_log(
-                "supervisor",
-                format!("llm_stop restored 1ch KWS recording mode; cleared_audio_frames={cleared}"),
-            );
-            Ok(Response::success_msg("llm_stop_ok"))
-        }
-    });
+        debug_log("supervisor", "Registering inbound command: llm_stop");
+        // 参数说明：
+        // - "llm_stop"：服务端一轮 LLM 会话结束后，请求当前 peer 回到 KWS 单通道录音模式
+        // - move |context, _request| ...：先切 recorder 模式，再清空旧双通道音频队列并返回确认
+        registry.register("llm_stop", {
+            let peer_contexts = peer_contexts.clone();
+            move |context, _request| {
+                debug_log(
+                    "supervisor",
+                    format!(
+                        "Executing inbound command llm_stop; peer={}",
+                        context.peer_id
+                    ),
+                );
+                let peer = peer_contexts
+                    .get(context.peer_id)
+                    .ok_or_else(|| anyhow::anyhow!("peer context not found: {}", context.peer_id))?;
+                peer.recorder
+                    .switch_to_llm_stop_audio(peer.audio_sender())?;
+                let cleared = peer.clear_audio_queue()?;
+                debug_log(
+                    "supervisor",
+                    format!("llm_stop restored 1ch KWS recording mode; cleared_audio_frames={cleared}"),
+                );
+                Ok(Response::success_msg("llm_stop_ok"))
+            }
+        });
+    } else {
+        debug_log(
+            "supervisor",
+            "Skipping inbound commands fast_recording/llm_start/llm_stop; LX06 audio capability unavailable",
+        );
+    }
 
     debug_log("supervisor", "Registering inbound command: stop_recording");
     // 参数说明：
