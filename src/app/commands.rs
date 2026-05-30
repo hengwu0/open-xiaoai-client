@@ -54,6 +54,24 @@ pub(crate) fn register_session_commands(
         Ok(Response::from_data(serde_json::json!(run_shell(&script)?)))
     });
 
+    debug_log("supervisor", "Registering inbound command: xiaoai_exit");
+    // 参数说明：
+    // - "xiaoai_exit"：远端请求退出/重启小爱原生会话
+    // - |_context, _request| ...：执行固定的 mico_aivs_lab 重启命令，不读取远端 payload
+    registry.register("xiaoai_exit", |_context, _request| {
+        const XIAOAI_EXIT_SCRIPT: &str = "/etc/init.d/mico_aivs_lab restart >/dev/null 2>&1";
+        debug_log(
+            "supervisor",
+            format!("Executing inbound command xiaoai_exit: {XIAOAI_EXIT_SCRIPT}"),
+        );
+        // 参数说明：
+        // - 固定命令由本地定义，避免复用 run_shell 的任意远端脚本能力
+        // - 返回 shell 执行结果，便于联调时观察 exit_code
+        Ok(Response::from_data(serde_json::json!(run_shell(
+            XIAOAI_EXIT_SCRIPT
+        )?)))
+    });
+
     debug_log("supervisor", "Registering inbound command: start_play");
     // 参数说明：
     // - "start_play"：远端发起播放的命令名
