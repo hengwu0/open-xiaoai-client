@@ -19,6 +19,8 @@
 - 强化安全边界：listener 和主动外连都支持 Bearer Token，调试输出会对 websocket token 做脱敏处理，避免敏感信息直接落日志。
 - 改善异常恢复与可观测性：单个 peer 的 reader / writer 可独立退出并收敛，session 会按生命周期完整清理，同时保留轻量调试日志与限频输出。
 - 提升可维护性：网络、协议、monitor、音频、shell、supervisor 等模块边界被重新梳理，后续扩展和排障成本更低。
+- 增加 LX06 专用录音能力初始化：启动阶段自动检查 `micocfg_model`，必要时补齐 `/etc/asound.conf` 与 `/etc/asound.conf.dts` 中的 `pcm.lx06_aec_2ch` 配置，并以该能力结果控制 `fast_recording` / `llm_start` / `llm_stop` 是否注册。
+- 增加 `xiaoai_exit` 远端命令：用于服务端请求 client 重启小爱原生 AIVS 服务。
 
 当前版本支持 3 种运行模式：
 
@@ -104,10 +106,55 @@ cross build --release --target armv7-unknown-linux-gnueabihf
 
 - `aplay`：播放 PCM 音频
 - `arecord`：采集 PCM 音频
-- `/bin/sh`：执行 `run_shell`
+- `micocfg_model`：启动阶段识别设备型号，LX06 设备才启用 fast recording 能力
+- `mount`：LX06 设备上用于 `mount --bind` 覆盖 ALSA 配置文件
+- `/etc/asound.conf`、`/etc/asound.conf.dts`：LX06 设备上会检查并按需补齐 `pcm.lx06_aec_2ch` 配置
+- `/etc/init.d/mico_aivs_lab`：`xiaoai_exit` 命令会重启该服务
+- `/bin/sh`：执行 `run_shell` 和固定的 `xiaoai_exit` 脚本
 - `mphelper mute_stat`：读取播放状态
 - `/tmp/mico_aivs_lab/instruction.log`：instruction monitor 监听文件
 - `/tmp/open-xiaoai/kws.log`：kws monitor 监听文件
+
+## LX06 fast recording 能力初始化
+
+启动时，client 会在进程级执行一次 LX06 音频能力检查，后续每轮 session 只复用该结果，不会因为 WebSocket 重连而重复执行 mount。
+
+检查流程：
+
+1. 执行 `micocfg_model`。
+2. 只有命令成功且输出为 `LX06` 时，才继续准备 LX06 录音能力；非 LX06 设备会跳过该能力，`fast_recording` / `llm_start` / `llm_stop` 不会注册。
+3. 分别读取 `/etc/asound.conf` 和 `/etc/asound.conf.dts`。
+4. 如果文件中已存在精确的 `pcm.lx06_aec_2ch` 定义，则认为该文件已具备能力，跳过 patch 与 mount。
+5. 如果不存在，则把原文件复制到程序所在目录下的同名文件：`asound.conf` 或 `asound.conf.dts`，并插入以下配置。优先插入到 `defaults.pcm.rate_converter "speexrate_medium"` 之前；如果找不到该锚点，则追加到文件末尾。
+6. 使用 `mount --bind <程序目录/文件名> /etc/asound.conf` 或 `mount --bind <程序目录/文件名> /etc/asound.conf.dts` 覆盖系统配置。
+7. 两个文件都成功处理后，才认为 LX06 fast recording 能力可用。
+
+自动插入的 ALSA 配置如下：
+
+```txt
+pcm.lx06_aec_2ch_route {
+    type route
+    slave {
+        pcm "Capture"
+        channels 8
+    }
+
+    ttable.0.0 1
+    ttable.1.6 1
+}
+
+pcm.lx06_aec_2ch {
+    type plug
+    slave {
+        pcm "lx06_aec_2ch_route"
+        format S32_LE
+        rate 48000
+        channels 2
+    }
+}
+```
+
+该配置把 `Capture` 的 ch0 与 ch6 路由成新的双通道 PCM；实际 `fast_recording` 阶段通过 `plug` 以 `-c 1` 获取单通道 KWS 音频，`llm_start` 后以 `-c 2` 获取双通道 LLM/AEC 音频。
 
 ## 目录结构
 
@@ -116,6 +163,7 @@ src/
 ├── main.rs
 ├── config.rs             # CLI 解析、usage 与 RunConfig
 ├── app/
+│   ├── capabilities.rs    # 启动阶段本机能力探测结果
 │   ├── commands.rs        # session 级命令注册与本地能力装配
 │   ├── fanout.rs          # session 级 monitor 句柄托管
 │   ├── mod.rs
@@ -148,6 +196,7 @@ src/
 ├── shell/
 │   ├── command.rs         # 本地 shell 命令执行与结果封装
 │   ├── device.rs          # 设备 MAC 读取与 listen code 生成
+│   ├── lx06_audio.rs      # LX06 ALSA fast recording 能力初始化
 │   ├── mod.rs
 │   └── speaker.rs         # 从旧项目迁移的设备控制方法备份（当前未接入编译链）
 └── transport/
@@ -355,16 +404,15 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 
 `fast_recording` 行为：
 
+- 只在启动阶段 LX06 fast recording 能力准备成功后注册；否则远端请求会得到“命令不存在”的错误响应
 - 只启动当前 peer 自己的 `AudioRecorder`
-- 不需要指定业务录音配置，固定使用 `arecord -D noop -f S32_LE -r 48000 -c 8 --quiet -t raw`
-- 唤醒前采集后的数据不会直接透传，而是会：
-  只保留 ch0 / ch2 / ch4
-  将每个通道按 normal 路径一致的算法从 S32 转成 S16
-  用 SpeexDSP 以质量档位 8 把每个通道从 48k 重采样到 16k
-  将 3 个通道重新合并成 raw，并直接发送原始音频数据
-- 当前 peer 收到 `llm_start` 后，会先清空该 peer 的待发音频队列并回复 `msg="llm_start_ok"`，之后改发 ch0 / ch6 原始双通道 `S32_LE / 48kHz` PCM；这两个通道会重新编号成 ch0 / ch1，不做 S16 转换，也不做 16k 重采样
-- 当前 peer 收到 `llm_stop` 后，会先把 fast recorder 切回 ch0 / ch2 / ch4 三通道 KWS 模式，清空尚未写入 WebSocket 的旧 raw 音频帧，再回复 `msg="llm_stop_ok"`
-- 当前 peer 再次发起 `fast_recording` 时，会先停掉旧的录音链路，再按同一套 fast profile 重新拉起
+- 不需要指定业务录音配置，固定使用 LX06 专用 PCM：`lx06_aec_2ch`
+- 初始 KWS 阶段固定启动：`arecord --quiet -t raw -D lx06_aec_2ch -f S16_LE -r 16000 -c 1`
+- KWS 阶段 `Stream(tag="record").bytes` 承载 `1ch / 16kHz / S16_LE` raw PCM
+- 当前 peer 收到 `llm_start` 后，会重启当前 peer 的 recorder 为双通道模式：`arecord --quiet -t raw -D lx06_aec_2ch -f S16_LE -r 16000 -c 2`，然后清空该 peer 的待发音频队列并回复 `msg="llm_start_ok"`
+- `llm_start_ok` 之后，`Stream(tag="record").bytes` 承载 `2ch / 16kHz / S16_LE` interleaved raw PCM
+- 当前 peer 收到 `llm_stop` 后，会重启 recorder 回到单通道 KWS 模式，清空该 peer 尚未写入 WebSocket 的旧 raw 音频帧，再回复 `msg="llm_stop_ok"`
+- 当前 peer 再次发起 `fast_recording` 时，如果同一 fast KWS profile 已经在运行，会直接返回成功，不重复 reopen ALSA；如果当前是其他 profile，则先停旧链路再切换
 - 如果当前 peer 之前已经通过 `start_recording` 开启了录音链路，`fast_recording` 也会先停掉旧链路，再切到 fast profile
 - 当前 peer 的录音数据只会回给当前 peer
 
@@ -386,7 +434,7 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 
 ## 支持的远端命令
 
-当前版本实际注册并支持以下 7 个远端命令。除特别说明外，命令执行成功时返回标准 `Response(code=0, msg="success")`；命令不存在或执行失败时返回 `Response(code=-1, msg=...)`。
+当前版本基础注册 7 个远端命令；当启动阶段 LX06 fast recording 能力准备成功时，会额外注册 `fast_recording` / `llm_start` / `llm_stop` 3 个命令。除特别说明外，命令执行成功时返回标准 `Response(code=0, msg="success")`；命令不存在或执行失败时返回 `Response(code=-1, msg=...)`。
 
 ### `get_version`
 
@@ -396,6 +444,12 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 ### `run_shell`
 
 - `payload` 需要是一个字符串，会通过 `/bin/sh -c` 在本机执行
+- 返回 `stdout`、`stderr`、`exit_code`
+
+### `xiaoai_exit`
+
+- 无需 `payload`
+- 收到后执行固定命令：`/etc/init.d/mico_aivs_lab restart >/dev/null 2>&1`
 - 返回 `stdout`、`stderr`、`exit_code`
 
 ### `start_play`
@@ -422,30 +476,28 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 ### `fast_recording`
 
 - 无需 `payload`
-- 启动当前 peer 自己的本地录音链路，但固定使用这套 arecord 参数：
-  `arecord -D noop -f S32_LE -r 48000 -c 8 --quiet -t raw`
-- fast 模式唤醒前，采集结果会经过以下处理后再放进 `Stream(tag="record").bytes`：
-  只保留 ch0 / ch2 / ch4
-  每通道按 normal 路径一致的算法做 S32 转 S16
-  每通道用 SpeexDSP 从 48k 重采样到 16k，质量档位 8
-  3 通道重新合并成 raw，并直接发送原始音频数据
-- 当前 peer 再次发起 `fast_recording` 时，会先停掉旧录音链路，再按同一套 fixed profile 重启
-- 如果当前 peer 之前已经通过 `start_recording` 开启录音，`fast_recording` 也会把旧链路关掉后再切过去
-- 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回该 peer 自己
+- 只有启动阶段 LX06 fast recording 能力准备成功时才会注册
+- 启动当前 peer 自己的本地录音链路，固定使用 LX06 专用 PCM：`lx06_aec_2ch`
+- KWS 阶段 arecord 参数为：`arecord --quiet -t raw -D lx06_aec_2ch -f S16_LE -r 16000 -c 1`
+- 成功后，录音数据会以 `Stream(tag="record")` 的形式持续发回该 peer 自己，`bytes` 承载 `1ch / 16kHz / S16_LE` raw PCM
 
 ### `llm_start`
 
 - 无需 `payload`
+- 只有启动阶段 LX06 fast recording 能力准备成功时才会注册
 - 只影响当前 peer 自己的 fast recorder 和待发音频队列
-- 收到后会先把该 peer 还没写入 WebSocket 的录音帧清空，再把 fast recorder 切到 ch0 / ch6 原始双通道模式
-- 成功后返回 `msg="llm_start_ok"`；后续 `Stream(tag="record").bytes` 承载 ch0 / ch6 重新编号后的 ch0 / ch1 `S32_LE / 48kHz` raw PCM，不做 S16 转换，也不做重采样
+- 收到后会把 fast recorder 重启为双通道模式：`arecord --quiet -t raw -D lx06_aec_2ch -f S16_LE -r 16000 -c 2`
+- 切换后会清空该 peer 还没写入 WebSocket 的旧录音帧
+- 成功后返回 `msg="llm_start_ok"`；后续 `Stream(tag="record").bytes` 承载 `2ch / 16kHz / S16_LE` interleaved raw PCM
 
 ### `llm_stop`
 
 - 无需 `payload`
+- 只有启动阶段 LX06 fast recording 能力准备成功时才会注册
 - 只影响当前 peer 自己的 fast recorder 和待发音频队列
-- 收到后会先把 fast recorder 切回 ch0 / ch2 / ch4 三通道 KWS 模式，再清空该 peer 尚未写入 WebSocket 的旧 raw 录音帧
-- 成功后返回 `msg="llm_stop_ok"`；后续 `Stream(tag="record").bytes` 重新承载三通道 S16 / 16k raw PCM，供服务端 KWS 等待下一次唤醒
+- 收到后会把 fast recorder 重启回 KWS 单通道模式：`arecord --quiet -t raw -D lx06_aec_2ch -f S16_LE -r 16000 -c 1`
+- 切换后会清空该 peer 尚未写入 WebSocket 的旧 raw 录音帧
+- 成功后返回 `msg="llm_stop_ok"`；后续 `Stream(tag="record").bytes` 重新承载 `1ch / 16kHz / S16_LE` raw PCM，供服务端 KWS 等待下一次唤醒
 
 ### `stop_recording`
 
@@ -485,7 +537,7 @@ router 和 monitor 不直接持有 websocket，它们只产生：
 - 发送范围：只发给当前启动该 recorder 的 peer，不广播给所有 peer
 - 通过 WebSocket 二进制帧发送，负载是序列化后的协议 `Stream`
 - 标准录音模式下，`bytes` 承载实际 PCM 音频数据
-- `fast_recording` 唤醒前，`bytes` 承载的是“三通道 S16 16k raw 数据”的原始字节；`llm_start_ok` 后，`bytes` 承载的是“ch0/ch6 重新编号后的双通道 S32_LE 48k raw 数据”的原始字节；`llm_stop_ok` 后回到三通道 S16 / 16k raw 数据
+- `fast_recording` 唤醒前，`bytes` 承载的是 `1ch / 16kHz / S16_LE` raw PCM；`llm_start_ok` 后，`bytes` 承载的是 `2ch / 16kHz / S16_LE` interleaved raw PCM；`llm_stop_ok` 后回到 `1ch / 16kHz / S16_LE` raw PCM
 - `data` 当前固定为空
 
 ## 生命周期总结
@@ -548,8 +600,9 @@ cargo test
 3. `app/session.rs`：理解单轮 session 内部有哪些 session 级资源、每个 peer 自己有哪些本地设备，以及 peer attach/detach 的过程
 4. `app/peer_context.rs`：理解每个 peer 的媒体对象、网络 sender 和 ws 关闭句柄是如何统一管理的
 5. `protocol/router.rs`：理解入站请求、本地命令执行、回包和出站分发
-6. `app/commands.rs`：理解命令如何按 `peer_id` 找到对应 peer 的完整上下文
-7. `app/ws_ingress.rs`：理解 listener / connector 如何把“已握手成功的 peer”送回 supervisor
+6. `app/capabilities.rs` / `shell/lx06_audio.rs`：理解启动阶段 LX06 音频能力如何检查和准备
+7. `app/commands.rs`：理解命令如何按 `peer_id` 找到对应 peer 的完整上下文，以及 fast recording 相关命令如何按能力条件注册
+8. `app/ws_ingress.rs`：理解 listener / connector 如何把“已握手成功的 peer”送回 supervisor
 
 当前源码里的中文注释遵循两个原则：
 
